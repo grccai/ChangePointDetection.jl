@@ -2,171 +2,298 @@ module ChangePointDetection
 using Random
 using LinearAlgebra
 
+const DEFAULT_SIGMA_LIST = [0.25, 0.5, 0.75, 1.0, 1.2, 1.5, 2.0, 2.5, 2.2, 3.0, 5.0]
+const DEFAULT_LAMBDA_LIST = [1.00000000e-03, 3.16227766e-03, 1.00000000e-02, 3.16227766e-02,
+                             1.00000000e-01, 3.16227766e-01, 1.00000000e+00, 3.16227766e+00,
+                             1.00000000e+01]
+
 """
-    squared_distance(X::Array{Float64,1},C::Array{Float64,1})
-    computes the square distance between elements of
-    X and C. returns squared_dist.
-    squared_dist[ij] = ||X[:, i] - C[:, j]||^2
+    squared_distance(X::AbstractVector, C::AbstractVector)
+
+Computes the pairwise squared distance between elements of X and C.
+Returns a matrix where `result[i,j] = (X[i] - C[j])^2`.
 """
-function squared_distance(X::Array{Float64,1},C::Array{Float64,1})
-    sqd = zeros(length(X),length(C))
-    for i in 1:length(X)
-        for j in 1:length(C)
-            sqd[i,j] = X[i]^2 + C[j]^2 - 2*X[i]*C[j]
-        end
-    end
-    return sqd
+function squared_distance(X::AbstractVector{T}, C::AbstractVector{T}) where {T<:AbstractFloat}
+    return X.^2 .+ (C').^2 .- 2 .* X .* C'
+end
+
+# Fallback for mixed types: promote
+function squared_distance(X::AbstractVector{<:AbstractFloat}, C::AbstractVector{<:AbstractFloat})
+    T = promote_type(eltype(X), eltype(C))
+    return squared_distance(T.(X), T.(C))
 end
 
 """
-    lsdd(x::Array{Float64,1}, y::Array{Float64,1}; folds = 5, sigma_list = nothing, lambda_list = nothing)
-    Computes the least-squares density-difference (lsdd) for arrays `x` and `y`.
-    The lsdd value characterizes how different the probability densities the generated 'x' and 'y' are.
-    The closer the lsdd is to 0, the more similar the probability densities are.
-    Input :
-        'x', 'y' : the arrays of data upon which to perform the lsdd computation.
-        folds : the number of cross-validation tests. higher is more precise but more expensive.
-        sigma_list, lambda_list : points defining the grid search during the optimization of gaussian kernels.
-    Returns :
-        L2 : lsdd value.
-"""
-function lsdd(x::Array{Float64,1}, y::Array{Float64,1}; folds = 5, sigma_list = nothing, lambda_list = nothing)
-    lx, ly = length(x), length(y)
-    b = min(lx+ly,300)
-    C = shuffle(vcat(x,y))[1:b]
-    CC_dist2 = squared_distance(C,C)
-    xC_dist2, yC_dist2 = squared_distance(x,C), squared_distance(y,C)
-    Tx, Ty = length(x) - div(lx,folds), length(y) - div(ly,folds)
-    #Define the training and testing data sets
-    #cv stands for cross-validation
-    cv_split1, cv_split2 = floor.(collect(1:lx)*folds/lx), floor.(collect(1:ly)*folds/ly)
-    cv_index1, cv_index2 = shuffle(cv_split1), shuffle(cv_split2)
-    tr_idx1,tr_idx2 = [findall(x->x!=i,cv_index1) for i in 1:folds], [findall(x->x!=i,cv_index2) for i in 1:folds]
-    te_idx1,te_idx2 = [findall(x->x==i,cv_index1) for i in 1:folds], [findall(x->x==i,cv_index2) for i in 1:folds]
-    xTr_dist, yTr_dist = [xC_dist2[i,:] for i in tr_idx1], [yC_dist2[i,:] for i in tr_idx2]
-    xTe_dist, yTe_dist = [xC_dist2[i,:] for i in te_idx1], [yC_dist2[i,:] for i in te_idx2]
-    #grid search is less expensive than optimization
-    if sigma_list == nothing
-        sigma_list = [0.25, 0.5, 0.75, 1, 1.2, 1.5, 2, 2.5, 2.2, 3, 5]
-    end
-    if lambda_list == nothing
-        lambda_list = [1.00000000e-03, 3.16227766e-03, 1.00000000e-02, 3.16227766e-02,
-       1.00000000e-01, 3.16227766e-01, 1.00000000e+00, 3.16227766e+00,
-       1.00000000e+01]
-    end
-    score_cv = zeros(length(sigma_list),length(lambda_list))
-    H = zeros(b,b)
-    hx_tr, hy_tr = [zeros(b,1) for i in 1:folds], [zeros(b,1) for i in 1:folds]
-    hx_te, hy_te = [zeros(1,b) for i in 1:folds], [zeros(1,b) for i in 1:folds]
-    theta = zeros(b)
+    set_H!(H, dist, sigma)
 
-    for (sigma_idx,sigma) in enumerate(sigma_list)
-        set_H(H,CC_dist2,sigma,b)
-        set_htr(hx_tr,xTr_dist,sigma,Tx), set_htr(hy_tr,yTr_dist,sigma,Ty)
-        set_hte(hx_te,xTe_dist,sigma,lx-Tx), set_hte(hy_te,yTe_dist,sigma,ly-Ty)
+Compute the RBF kernel matrix in-place: `H[i,j] = sqrt(sigma^2 * pi) * exp(-dist[i,j] / (4*sigma^2))`.
+"""
+function set_H!(H::AbstractMatrix{T}, dist::AbstractMatrix{T}, sigma::Real) where {T<:AbstractFloat}
+    s2 = T(sigma)^2
+    coeff = sqrt(s2 * T(pi))
+    inv4s2 = T(-1) / (4 * s2)
+    @. H = coeff * exp(dist * inv4s2)
+    return nothing
+end
+
+"""
+    set_h!(h_vecs, dists, sigma, count)
+
+Compute kernel mean vectors in-place for each CV fold.
+`h_vecs[i] .= (1/count) * sum(exp.(-dists[i] / (2*sigma^2)), dims=1)`
+"""
+function set_h!(h_vecs::Vector{Vector{T}}, dists::Vector{<:AbstractMatrix{T}}, sigma::Real, count::Integer) where {T<:AbstractFloat}
+    inv2s2 = T(-1) / (2 * T(sigma)^2)
+    inv_count = T(1) / T(count)
+    for (i, dist) in enumerate(dists)
+        # Compute column sums of exp.(-dist/(2*sigma^2)) and scale
+        h = h_vecs[i]
+        fill!(h, zero(T))
+        @inbounds for col in 1:size(dist, 2)
+            s = zero(T)
+            for row in 1:size(dist, 1)
+                s += exp(dist[row, col] * inv2s2)
+            end
+            h[col] = s * inv_count
+        end
+    end
+    return nothing
+end
+
+"""
+    lsdd(x, y; folds=5, sigma_list=nothing, lambda_list=nothing, rng=Random.default_rng())
+
+Computes the least-squares density-difference (LSDD) between arrays `x` and `y`.
+The LSDD value characterizes how different the probability densities that generated `x` and `y` are.
+The closer the LSDD is to 0, the more similar the probability densities are.
+
+# Arguments
+- `x`, `y`: arrays of data upon which to perform the LSDD computation.
+- `folds`: number of cross-validation folds. Higher is more precise but more expensive.
+- `sigma_list`, `lambda_list`: grid points for kernel bandwidth and regularization optimization.
+- `rng`: random number generator (for thread safety).
+
+# Returns
+- `L2`: the LSDD value.
+"""
+function lsdd(x::AbstractVector{T}, y::AbstractVector{T};
+              folds::Integer = 5,
+              sigma_list::Union{Nothing, AbstractVector{<:Real}} = nothing,
+              lambda_list::Union{Nothing, AbstractVector{<:Real}} = nothing,
+              rng::AbstractRNG = Random.default_rng()) where {T<:AbstractFloat}
+
+    lx, ly = length(x), length(y)
+    b = min(lx + ly, 300)
+
+    # Select b random centers from the combined data without vcat allocation
+    perm = randperm(rng, lx + ly)
+    C = Vector{T}(undef, b)
+    @inbounds for ci in 1:b
+        idx = perm[ci]
+        C[ci] = idx <= lx ? x[idx] : y[idx - lx]
+    end
+
+    CC_dist2 = squared_distance(C, C)
+    xC_dist2 = squared_distance(collect(T, x), C)
+    yC_dist2 = squared_distance(collect(T, y), C)
+
+    Tx = lx - div(lx, folds)
+    Ty = ly - div(ly, folds)
+
+    # Cross-validation fold indices
+    cv_split1 = floor.(Int, collect(1:lx) .* folds ./ lx)
+    cv_split2 = floor.(Int, collect(1:ly) .* folds ./ ly)
+    cv_index1 = shuffle(rng, cv_split1)
+    cv_index2 = shuffle(rng, cv_split2)
+
+    tr_idx1 = [findall(!=(i), cv_index1) for i in 1:folds]
+    tr_idx2 = [findall(!=(i), cv_index2) for i in 1:folds]
+    te_idx1 = [findall(==(i), cv_index1) for i in 1:folds]
+    te_idx2 = [findall(==(i), cv_index2) for i in 1:folds]
+
+    xTr_dist = [xC_dist2[idx, :] for idx in tr_idx1]
+    yTr_dist = [yC_dist2[idx, :] for idx in tr_idx2]
+    xTe_dist = [xC_dist2[idx, :] for idx in te_idx1]
+    yTe_dist = [yC_dist2[idx, :] for idx in te_idx2]
+
+    # Sigma and lambda lists
+    sigmas = sigma_list === nothing ? T.(DEFAULT_SIGMA_LIST) : T.(sigma_list)
+    lambdas = lambda_list === nothing ? T.(DEFAULT_LAMBDA_LIST) : T.(lambda_list)
+    n_sigma = length(sigmas)
+    n_lambda = length(lambdas)
+
+    score_cv = zeros(T, n_sigma, n_lambda)
+    H = Matrix{T}(undef, b, b)
+
+    # Pre-allocate h vectors as flat Vector{T} for each fold
+    hx_tr = [Vector{T}(undef, b) for _ in 1:folds]
+    hy_tr = [Vector{T}(undef, b) for _ in 1:folds]
+    hx_te = [Vector{T}(undef, b) for _ in 1:folds]
+    hy_te = [Vector{T}(undef, b) for _ in 1:folds]
+
+    # Pre-allocate workspace for the CV inner loop
+    h_tr_buf = Vector{T}(undef, b)
+    h_te_buf = Vector{T}(undef, b)
+    theta_buf = Vector{T}(undef, b)
+    Htheta_buf = Vector{T}(undef, b)
+    alpha_buf = Vector{T}(undef, b)
+    scaled_buf = Vector{T}(undef, b)
+
+    for (sigma_idx, sigma) in enumerate(sigmas)
+        set_H!(H, CC_dist2, sigma)
+        set_h!(hx_tr, xTr_dist, sigma, Tx)
+        set_h!(hy_tr, yTr_dist, sigma, Ty)
+        set_h!(hx_te, xTe_dist, sigma, lx - Tx)
+        set_h!(hy_te, yTe_dist, sigma, ly - Ty)
+
+        # Eigendecompose H once per sigma to avoid repeated Cholesky solves
+        F = eigen(Symmetric(H))
+        eigvals = F.values
+        V = F.vectors
+        Vt = V'  # pre-transpose for reuse
 
         for i in 1:folds
-            h_tr = hx_tr[i] - hy_tr[i]
-            h_te = hx_te[i] - hy_te[i]
-            for (lambda_idx,lambda) in enumerate(lambda_list)
-                set_theta(theta, H, lambda, h_tr, b)
-                score_cv[sigma_idx, lambda_idx] += dot(theta, H*theta) - 2*dot(theta, h_te)
+            @. h_tr_buf = hx_tr[i] - hy_tr[i]
+            @. h_te_buf = hx_te[i] - hy_te[i]
+
+            # Project h_tr into eigenbasis: alpha = V' * h_tr
+            mul!(alpha_buf, Vt, h_tr_buf)
+
+            for (lambda_idx, lam) in enumerate(lambdas)
+                # theta = V * diag(1/(eigenvalues + lambda)) * V' * h_tr
+                @inbounds for k in 1:b
+                    scaled_buf[k] = alpha_buf[k] / (eigvals[k] + lam)
+                end
+                mul!(theta_buf, V, scaled_buf)
+
+                # H*theta = V * diag(eigenvalues / (eigenvalues + lambda)) * V' * h_tr
+                @inbounds for k in 1:b
+                    scaled_buf[k] = eigvals[k] * alpha_buf[k] / (eigvals[k] + lam)
+                end
+                mul!(Htheta_buf, V, scaled_buf)
+
+                score_cv[sigma_idx, lambda_idx] += dot(theta_buf, Htheta_buf) - 2 * dot(theta_buf, h_te_buf)
             end
         end
     end
-    #retrieve the value of the optimal parameters
-    sigma_chosen = sigma_list[findmin(score_cv)[2][2]]
-    lambda_chosen = lambda_list[findmin(score_cv)[2][2]]
-    #calculating the new optimal solution
-    H = sqrt((sigma_chosen^2)*pi)*exp.(-CC_dist2/(4*sigma_chosen^2))
-    H_lambda = H + lambda_chosen*Matrix{Float64}(I, b, b)
-    h = (1/lx)*sum(exp.(-xC_dist2/(2*sigma_chosen^2)),dims = 1) - (1/ly)*sum(exp.(-yC_dist2/(2*sigma_chosen^2)),dims = 1)
-    theta_final =  H_lambda\transpose(h)
-    f = transpose(theta_final).*sum(exp.(-vcat(xC_dist2,yC_dist2)/(2*sigma_chosen^2)),dims = 1)
-    L2 = 2*dot(theta_final,h) - dot(theta_final,H*theta_final)
+
+    # Retrieve optimal parameters (Bug fix: use [1] for sigma row, [2] for lambda column)
+    best_idx = findmin(score_cv)[2]
+    sigma_chosen = sigmas[best_idx[1]]
+    lambda_chosen = lambdas[best_idx[2]]
+
+    # Final computation with optimal parameters
+    set_H!(H, CC_dist2, sigma_chosen)
+    # Add regularization in-place
+    @inbounds for k in 1:b
+        H[k, k] += lambda_chosen
+    end
+
+    inv2s2 = T(-1) / (2 * sigma_chosen^2)
+    inv_lx = T(1) / T(lx)
+    inv_ly = T(1) / T(ly)
+
+    # Compute h = (1/lx)*sum(K(x,C)) - (1/ly)*sum(K(y,C))
+    h_final = Vector{T}(undef, b)
+    @inbounds for j in 1:b
+        sx = zero(T)
+        for i in 1:lx
+            sx += exp(xC_dist2[i, j] * inv2s2)
+        end
+        sy = zero(T)
+        for i in 1:ly
+            sy += exp(yC_dist2[i, j] * inv2s2)
+        end
+        h_final[j] = sx * inv_lx - sy * inv_ly
+    end
+
+    # Solve (H + lambda*I) * theta = h  (H already has lambda*I added)
+    theta_final = H \ h_final
+
+    # Recompute H without regularization for the L2 score
+    set_H!(H, CC_dist2, sigma_chosen)
+    mul!(Htheta_buf, H, theta_final)
+    L2 = 2 * dot(theta_final, h_final) - dot(theta_final, Htheta_buf)
+
     return L2
 end
 
-function set_H(H::Array{Float64,2},dist::Array{Float64,2},sigma::Float64,b::Int64)
-    for i in 1:b
-        for j in 1:b
-            H[i,j] = sqrt((sigma^2)*pi)*exp(-dist[i,j]/(4*sigma^2))
-        end
-    end
-end
-
-function set_theta(theta::Array{Float64,1},H::Array{Float64,2},lambda::Float64,h::Array{Float64,2},b::Int64)
-    Hl = (H + lambda*Matrix{Float64}(I, b, b))
-    LAPACK.posv!('L', Hl, h)
-    theta = h
-end
-
-
-function set_htr(h::Array{Array{Float64,2},1},dists::Array{Array{Float64,2},1},sigma::Float64,T::Int64)
-        for (CVidx,dist) in enumerate(dists)
-            for (idx,value) in enumerate((1/T)*sum(exp.(-dist/(2*sigma^2)),dims = 1))
-                h[CVidx][idx] = value
-            end
-        end
-end
-
-function set_hte(h::Array{Array{Float64,2},1},dists::Array{Array{Float64,2},1},sigma::Float64,T::Int64)
-    for (CVidx,dist) in enumerate(dists)
-        for (idx,value) in enumerate((1/T)*sum(exp.(-dist/(2*sigma^2)),dims = 1))
-            h[CVidx][idx] = value
-        end
-    end
+# Convenience: promote mixed float types
+function lsdd(x::AbstractVector{<:AbstractFloat}, y::AbstractVector{<:AbstractFloat}; kwargs...)
+    T = promote_type(eltype(x), eltype(y))
+    return lsdd(T.(x), T.(y); kwargs...)
 end
 
 """
-    lsdd_profile(ts; window = 150)
-    returns for each point of given time-series 'ts' the lsdd value.
-    Allows to estimate changes in the underlying probability density : a peak in lsdd value indicate a change point.
+    lsdd_profile(ts; window=150)
+
+Returns for each point of the given time-series `ts` the LSDD value.
+Allows estimation of changes in the underlying probability density:
+a peak in the LSDD value indicates a change point.
+
+Uses multithreading when Julia is started with multiple threads.
 """
-function lsdd_profile(ts; window = 150)
-    diff = []
-    for i in 1:(length(ts)-2*window)
-        pd1 = [ts[i+k] for k in 1:window]
-        pd2 = [ts[i+window+k] for k in 1:window]
-        push!(diff, lsdd(pd1,pd2)[1])
+function lsdd_profile(ts::AbstractVector{T}; window::Integer = 150) where {T<:AbstractFloat}
+    n = length(ts)
+    niter = n - 2 * window
+    niter <= 0 && return T[]
+
+    result = Vector{T}(undef, niter)
+
+    # Pin BLAS to 1 thread to avoid oversubscription when using Julia threads
+    old_blas_threads = BLAS.get_num_threads()
+    BLAS.set_num_threads(1)
+    try
+        Threads.@threads for i in 1:niter
+            pd1 = @view ts[(i+1):(i+window)]
+            pd2 = @view ts[(i+window+1):(i+2*window)]
+            # Use a per-iteration RNG for thread safety and reproducibility
+            local_rng = Xoshiro(i)
+            result[i] = lsdd(pd1, pd2; rng=local_rng)
+        end
+    finally
+        BLAS.set_num_threads(old_blas_threads)
     end
-    return diff
+
+    return result
+end
+
+# Fallback for non-AbstractFloat (e.g., Int arrays): convert to Float64
+function lsdd_profile(ts::AbstractVector; window::Integer = 150)
+    return lsdd_profile(Float64.(ts); window = window)
 end
 
 """
-    changepoints(ts; threshold = 0.5, window = 150)
-Estimates change points in the underlying probability density of a time series via lsdd.
-Every time the lsdd value exeeds the given threshold, a change point is detected.
-returns the list of detected change points.
+    changepoints(ts; threshold=0.5, window=150)
+
+Estimates change points in the underlying probability density of a time series via LSDD.
+Every time the LSDD value exceeds the given threshold, a change point is detected.
+Returns the list of detected change point indices.
 """
 function changepoints(ts; threshold = 0.5, window = 150)
     profile = lsdd_profile(ts; window = window)
-    points = []
-    exceeded = false
-    for (index, value) in enumerate(profile)
-        if (value > threshold) && exceeded == false
-            push!(points, index)
-            exceeded = true
-        elseif (value < threshold) && exceeded == true
-            exceeded = false
-        end
-    end
-    return points
+    return getpoints(profile; threshold = threshold)
 end
 
+"""
+    getpoints(profile; threshold=0.9)
+
+Given an LSDD profile, returns indices where the profile exceeds the threshold.
+Uses hysteresis to avoid detecting multiple points for one change.
+"""
 function getpoints(profile; threshold = 0.9)
     points = Int[]
     exceeded = false
     for (index, value) in enumerate(profile)
-        if (value > threshold) && exceeded == false
+        if value > threshold && !exceeded
             push!(points, index)
             exceeded = true
-        elseif (value < threshold) && exceeded == true
+        elseif value < threshold && exceeded
             exceeded = false
         end
     end
     return points
 end
 
-export squared_distance, lsdd, lsdd_profile, changepoints
+export squared_distance, lsdd, lsdd_profile, changepoints, getpoints
 end
