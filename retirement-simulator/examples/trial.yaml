@@ -110,8 +110,12 @@ market:
   correlation_bond_cash: 0.0
 
 social_security:
-  monthly_at_67: 3000           # rough default; adjust to your SSA statement
-  claim_age: 67
+  # PIA computed from earnings history:
+  #   2011-2021 @ $160k, 2022-2025 @ $225k, 2026+ @ trial-scenario trajectory.
+  #   AIME (in 2024$) = $13,541/mo  -> PIA at FRA(67) = $3,915/mo.
+  # Claim age 70 (124% of PIA) wins on failure-rate + CVaR criterion.
+  monthly_at_67: 4855           # = PIA * 1.24 (delayed retirement credits to 70)
+  claim_age:     70
 
 withdrawal:
   strategy: tax_aware
