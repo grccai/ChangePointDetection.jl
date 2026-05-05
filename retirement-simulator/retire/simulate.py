@@ -376,7 +376,14 @@ def _step_accumulation(s: VState, scn: Scenario, age: float, year_idx: int,
     # 5) Take-home and residual taxable savings
     take_home = (total_wages - trad_401k - trad_ira - roth_direct
                  - mbdr - bill_total)
-    implied_living = (1.0 - scn.savings.rate) * total_wages
+    # Living budget: explicit working-years post-tax target (preferred) or
+    # the savings-rate residual.
+    if scn.spending.working_annual_real is not None:
+        # Explicit post-tax living target, inflation-adjusted to nominal.
+        implied_living = (scn.spending.working_annual_real
+                          * s.cumulative_inflation)
+    else:
+        implied_living = (1.0 - scn.savings.rate) * total_wages
     taxable_savings = np.maximum(0.0, take_home - implied_living)
     deposit_taxable_st_split(s, taxable_savings, tgt_tax)
 

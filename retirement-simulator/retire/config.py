@@ -91,8 +91,19 @@ class SocialSecurity:
 
 @dataclass
 class Spending:
+    """Retirement spending target. `annual_real` is in today's dollars and is
+    interpreted as POST-TAX consumption that the simulator must deliver each
+    year, grossing-up withdrawals to cover the tax bill.
+
+    `working_annual_real` (optional) is the working-years post-tax living
+    budget, also in today's dollars. If set, it overrides the savings-rate
+    residual: each working year, anything above (taxes + contributions +
+    `working_annual_real`) flows to taxable savings. If unset, the simulator
+    falls back to `(1 - savings.rate) * gross_wages` as the implied living
+    budget."""
     annual_real: float
     smile: Literal["flat", "bengen"] = "flat"
+    working_annual_real: float | None = None
 
 
 @dataclass

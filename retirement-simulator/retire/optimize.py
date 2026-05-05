@@ -140,40 +140,44 @@ def _build_policy(x: np.ndarray, scn_base: Scenario,
                         trad_contribution_split=trad_split)
 
 
-def _objective_for(scn_base: Scenario, cfg: OptimizerConfig
-                   ) -> Callable[[np.ndarray], float]:
-    horizon = scn_base.profile.horizon()
-    years_to_retire = scn_base.profile.years_to_retirement()
+@dataclass
+class _Objective:
+    """Picklable callable for scipy.differential_evolution(workers=N)."""
+    scn_base: Scenario
+    cfg: OptimizerConfig
+    horizon: int
+    years_to_retire: int
 
-    def obj(x: np.ndarray) -> float:
-        policy = _build_policy(x, scn_base, cfg)
-        scn = deepcopy(scn_base)
-        scn.simulation.n_paths = cfg.n_paths_inner
-        scn.simulation.seed = cfg.seed
+    def __call__(self, x: np.ndarray) -> float:
+        policy = _build_policy(x, self.scn_base, self.cfg)
+        scn = deepcopy(self.scn_base)
+        scn.simulation.n_paths = self.cfg.n_paths_inner
+        scn.simulation.seed = self.cfg.seed
         result = simulate(scn, policy=policy)
 
-        # Build per-path discounted utility of consumption
         n = len(result.paths)
         util = np.zeros(n)
         for i, p in enumerate(result.paths):
-            real_consump = (p.real_spending_by_year
-                            - p.real_shortfall_by_year)
-            real_consump = np.maximum(real_consump, 0.0)
-            # Only discount/utility from retirement onwards
-            betas = cfg.beta ** np.arange(horizon)
-            betas[:years_to_retire] = 0.0  # ignore accumulation consumption
-            u = _crra(np.maximum(real_consump, 1e-3), cfg.gamma)
+            real_consump = np.maximum(
+                p.real_spending_by_year - p.real_shortfall_by_year, 0.0)
+            betas = self.cfg.beta ** np.arange(self.horizon)
+            betas[:self.years_to_retire] = 0.0
+            u = _crra(np.maximum(real_consump, 1e-3), self.cfg.gamma)
             util[i] = float(np.sum(betas * u))
-            # Bequest
-            util[i] += cfg.bequest_weight * float(_crra(
-                np.array([max(p.terminal_real_wealth, 1.0)]), cfg.gamma)[0])
+            util[i] += self.cfg.bequest_weight * float(_crra(
+                np.array([max(p.terminal_real_wealth, 1.0)]), self.cfg.gamma)[0])
 
         expected_util = float(np.mean(util))
-        fail_pen = cfg.failure_penalty * result.failure_rate()
-        # We *minimize*, so return negative utility plus penalty
+        fail_pen = self.cfg.failure_penalty * result.failure_rate()
         return -expected_util + fail_pen
 
-    return obj
+
+def _objective_for(scn_base: Scenario, cfg: OptimizerConfig) -> _Objective:
+    return _Objective(
+        scn_base=scn_base, cfg=cfg,
+        horizon=scn_base.profile.horizon(),
+        years_to_retire=scn_base.profile.years_to_retirement(),
+    )
 
 
 def optimize(scn: Scenario, cfg: OptimizerConfig | None = None

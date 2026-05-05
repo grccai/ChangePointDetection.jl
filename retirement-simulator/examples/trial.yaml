@@ -1,0 +1,103 @@
+# Trial scenario from user spec.
+#
+# 37-year-old single filer, California resident, $240k CA-source wages,
+# FIRE target age 50, plan to age 95.
+#
+# Lots inside taxable account encode the cost-basis structure:
+#   $324k taxable = 90% stock + 10% money market (cash).
+#     Half ($162k) is ST with 100% gain (MV = 2*basis -> basis = MV/2).
+#     Half ($162k) is LT with  80% gain (MV = 1.8*basis -> basis = MV/1.8).
+#     Money-market portion held at full basis (no capital gain on MM funds).
+
+profile:
+  birthdate:        1989-05-05
+  start_date:       2026-05-05
+  retirement_date:  2039-05-05    # age 50
+  end_of_plan_date: 2084-05-05    # age 95
+  filing_status:    single
+
+income:
+  sources:
+    - {state: CA, start: 2026-05-05, end: 2039-05-05, gross_annual: 240000, growth_rate: 0.03}
+
+state_taxes:
+  residency:
+    - {state: CA, start: 2026-05-05, end: 2084-05-05}
+
+savings:
+  rate: 0.40
+  contributions:
+    trad_401k: max
+    roth_401k: 0
+    trad_ira: 0
+    roth_ira: 7000              # backdoor implicit at this income
+    mega_backdoor_roth: max     # post-tax 401k -> Roth, up to 415(c) limit
+    employer_match_rate: 0.05
+
+spending:
+  annual_real: 100000           # POST-TAX retirement spending in today's $
+  smile: bengen
+  working_annual_real: 100000   # POST-TAX working-years living budget;
+                                # everything above (taxes + contribs + this)
+                                # flows to taxable savings.
+
+initial_portfolio:
+  taxable:
+    lots:
+      # Stock, 90% of $324k = $291.6k MV total. Split half/half ST/LT.
+      # ST stock: $145.8k MV, 100% gain -> basis = $72.9k. age 0.5 (well under 1y).
+      - {asset: stock, market_value: 145800, cost_basis: 72900, age_years: 0.5}
+      # LT stock: $145.8k MV, 80% gain -> basis = $81k. age 3 (well over 1y).
+      - {asset: stock, market_value: 145800, cost_basis: 81000, age_years: 3.0}
+      # Money market: 10% of $324k = $32.4k. Held at full basis (no cap gain).
+      # Split half/half to match the ST/LT structure for symmetry, but basis = MV.
+      - {asset: cash,  market_value:  16200, cost_basis: 16200, age_years: 0.5}
+      - {asset: cash,  market_value:  16200, cost_basis: 16200, age_years: 3.0}
+  traditional:
+    stock: 136000               # $160k * 0.85
+    bond:   24000               # $160k * 0.15
+    cash:       0
+  roth:
+    stock: 136000
+    bond:   24000
+    cash:       0
+    basis:  80000               # assumed: half of Roth IRA is direct contributions
+
+# Target allocations (current asset mix; optimizer can override).
+target_allocations:
+  taxable:
+    stock: 0.90
+    bond:  0.00
+    cash:  0.10
+  traditional:
+    stock: 0.85
+    bond:  0.15
+    cash:  0.00
+  roth:
+    stock: 0.85
+    bond:  0.15
+    cash:  0.00
+
+market:
+  stocks: {real_return: 0.06, vol: 0.18}
+  bonds:  {real_return: 0.02, vol: 0.06}
+  cash:   {real_return: 0.005, vol: 0.01}
+  inflation_mean: 0.025
+  inflation_vol: 0.0
+  correlation_stock_bond: 0.10
+  correlation_stock_cash: 0.0
+  correlation_bond_cash: 0.0
+
+social_security:
+  monthly_at_67: 3000           # rough default; adjust to your SSA statement
+  claim_age: 67
+
+withdrawal:
+  strategy: tax_aware
+  roth_conversion_target_bracket: 0.12
+  aca_magi_cap: 50000
+
+simulation:
+  n_paths: 5000
+  seed: 42
+  return_model: gbm
