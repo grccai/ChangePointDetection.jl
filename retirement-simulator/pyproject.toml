@@ -9,6 +9,7 @@ dependencies = [
   "pyyaml>=6.0",
   "typer>=0.12",
   "openpyxl>=3.1",
+  "matplotlib>=3.7",
 ]
 
 [project.scripts]
