@@ -33,10 +33,8 @@ income:
     # 2) WA stint, 60/40 OR/WA. (Common pattern: live in WA, work in OR.)
     - {state: OR, start: 2026-08-20, end: 2028-12-31, gross_annual: 145000, growth_rate: 0.03}
     - {state: WA, start: 2026-08-20, end: 2028-12-31, gross_annual:  97000, growth_rate: 0.03}
-    # 3) Back to CA, picking up the trajectory
-    - {state: CA, start: 2028-12-31, end: 2039-05-05, gross_annual: 260000, growth_rate: 0.03}
-    # 4) Step-down at age 50 to $150k, riding it to retirement at 55
-    - {state: CA, start: 2039-05-05, end: 2044-05-05, gross_annual: 150000, growth_rate: 0.03}
+    # 3) Back to CA, picking up the trajectory; ride it all the way to retirement at 55
+    - {state: CA, start: 2028-12-31, end: 2044-05-05, gross_annual: 260000, growth_rate: 0.03}
 
 state_taxes:
   residency:
