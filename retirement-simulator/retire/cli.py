@@ -175,10 +175,19 @@ def validate(
     """Parse the YAML config and print a structured echo + sanity checks."""
     scn = load_scenario(config)
     p = scn.initial_portfolio
-    print(f"Profile: age {scn.profile.age} -> retire {scn.profile.retirement_age} "
-          f"-> end {scn.profile.end_of_plan_age} ({scn.profile.filing_status})")
-    print(f"Income:  ${scn.income.current_gross:,.0f} growing at "
-          f"{100*scn.income.growth_rate:.2f}%/yr nominal")
+    pr = scn.profile
+    print(f"Profile: born {pr.birthdate}, sim starts {pr.start_date} "
+          f"(age {pr.age:.1f}), retires {pr.retirement_date}, "
+          f"plan ends {pr.end_of_plan_date} ({pr.filing_status})")
+    if scn.state_taxes.income_sources:
+        print("Income sources:")
+        for src in scn.state_taxes.income_sources:
+            print(f"  {src.state:>4}  {src.start} -> {src.end}  "
+                  f"${src.gross_annual:>10,.0f}/yr  growth {100*src.growth_rate:.2f}%/yr")
+    if scn.state_taxes.residency:
+        print("Residency:")
+        for r in scn.state_taxes.residency:
+            print(f"  {r.state:>4}  {r.start} -> {r.end}")
     print(f"Savings: {100*scn.savings.rate:.0f}% of gross")
     print(f"Spending target: ${scn.spending.annual_real:,.0f}/yr real, "
           f"smile={scn.spending.smile}")

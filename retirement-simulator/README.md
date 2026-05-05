@@ -16,10 +16,14 @@ because branch hosting requires it.
 ## What it does
 
 Given:
-* your age, income, savings rate, target retirement (FIRE) age and end-of-plan
-  age, filing status;
-* a **state-of-residence and state-of-employment timeline**, with optional
-  overlap (e.g. half-time job in two states);
+* your **birthdate**, simulation **start_date**, **retirement_date**, and
+  **end_of_plan_date** (all calendar dates), filing status;
+* a list of **income sources**, each with state, [start, end) calendar
+  dates, annual gross dollar amount, and (optional) growth rate; multiple
+  concurrent sources are summed and mid-year transitions pro-rate cleanly;
+* a list of **residency periods** with state and [start, end) dates;
+* savings rate and contribution policy (Traditional 401k, Roth 401k, IRAs,
+  mega-backdoor Roth, employer match);
 * current account balances split across taxable / Traditional / Roth, and
   inside taxable account the per-lot **cost basis** and **holding period**
   (long-term vs short-term);
@@ -68,6 +72,39 @@ PYTHONPATH=. python -m retire.cli --help
 ```
 
 Python 3.10+.
+
+## Schema (date-based)
+
+```yaml
+profile:
+  birthdate:        1991-04-15
+  start_date:       2026-05-05      # first simulated year starts here
+  retirement_date:  2041-05-05
+  end_of_plan_date: 2086-05-05
+  filing_status:    single
+
+income:
+  sources:
+    - {state: CA, start: 2026-05-05, end: 2030-08-01, gross_annual: 200000, growth_rate: 0.03}
+    - {state: WA, start: 2030-08-01, end: 2041-05-05, gross_annual: 250000, growth_rate: 0.025}
+    # Concurrent sources stack; mid-year transitions pro-rate cleanly.
+    - {state: OR, start: 2032-01-01, end: 2034-01-01, gross_annual:  60000}
+
+state_taxes:                       # where you LIVE (taxes investment income)
+  residency:
+    - {state: CA, start: 2026-05-05, end: 2030-08-01}
+    - {state: WA, start: 2030-08-01, end: 2086-05-05}
+```
+
+Each income source has (state, start, end, gross_annual, growth_rate). The
+year window for simulation year `y` is `[start_date + y years, start_date +
+(y+1) years)`. Wages are pro-rated by overlap days, then grown from each
+source's `start` at that source's `growth_rate` to the mid-overlap point.
+Wages are taxed by the source's state; investment income (capital gains,
+dividends, RMDs, conversions) by the residency state(s) active that year.
+
+If you provide the legacy age-based form (`age`, `retirement_age`,
+`end_of_plan_age`), it is converted to dates anchored to today.
 
 ## Usage
 

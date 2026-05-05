@@ -1,31 +1,35 @@
-"""Integration tests for the vectorised simulator.
+"""Integration tests for the vectorised simulator (date-based config).
 
-These tests don't validate the financial model precisely (that's research-
-grade work). They check invariants and consistency:
+Checks invariants and consistency:
   * Wealth is non-negative.
   * Higher spending => more failures (monotonicity).
   * The 5-year clock prevents penalty-free withdrawal of fresh conversions.
   * Mega-backdoor Roth contributes more than zero when enabled.
+  * State tax matters: CA-resident-during-FIRE worse than WA-resident.
 """
 
+import datetime as dt
 import math
 import numpy as np
 import pytest
 
 from retire.accounts import Asset, Lot, Portfolio
 from retire.config import (
-    Profile, Income, Savings, Contributions, Spending,
+    Profile, Savings, Contributions, Spending,
     SocialSecurity, WithdrawalPolicy, Allocation, TargetAllocations,
     MarketConfig, SimulationParams, Scenario,
 )
 from retire.returns import AssetParams
 from retire.simulate import simulate
-from retire.state_taxes import StateTimeline, StateAssignment
+from retire.state_taxes import (StateTimeline, ResidencyPeriod, IncomeSource)
 from retire.vstate import VState
 
 
+D = dt.date
+
+
 def _basic_scenario(spending: float = 60_000,
-                    horizon_age: int = 80,
+                    end_date: dt.date = D(2066, 1, 1),  # ~age 80
                     state_timeline: StateTimeline | None = None,
                     contributions: Contributions | None = None,
                     n_paths: int = 200) -> Scenario:
@@ -38,10 +42,22 @@ def _basic_scenario(spending: float = 60_000,
     p.roth.balances[Asset.STOCK] = 100_000
     p.roth.roth_basis = 50_000
 
+    profile = Profile(
+        birthdate=D(1986, 1, 1), start_date=D(2026, 1, 1),
+        retirement_date=D(2041, 1, 1), end_of_plan_date=end_date,
+        filing_status="single",
+    )
+
+    if state_timeline is None:
+        # Default: single income source 2026-2041 in NONE (no state tax).
+        state_timeline = StateTimeline(
+            income_sources=[IncomeSource(
+                state="NONE", start=D(2026, 1, 1), end=D(2041, 1, 1),
+                gross_annual=200_000, growth_rate=0.03)],
+        )
+
     return Scenario(
-        profile=Profile(age=40, retirement_age=55,
-                        end_of_plan_age=horizon_age, filing_status="single"),
-        income=Income(current_gross=200_000, growth_rate=0.03),
+        profile=profile, state_taxes=state_timeline,
         savings=Savings(rate=0.30,
                         contributions=contributions or Contributions()),
         spending=Spending(annual_real=spending, smile="flat"),
@@ -56,7 +72,6 @@ def _basic_scenario(spending: float = 60_000,
             bonds=AssetParams(0.02, 0.06),
             cash=AssetParams(0.005, 0.01),
         ),
-        state_taxes=state_timeline or StateTimeline(),
         social_security=SocialSecurity(monthly_at_67=0, claim_age=67),
         withdrawal=WithdrawalPolicy(strategy="tax_aware",
                                      roth_conversion_target_bracket=None),
@@ -67,35 +82,92 @@ def _basic_scenario(spending: float = 60_000,
 def test_wealth_non_negative():
     r = simulate(_basic_scenario(spending=80_000))
     for p in r.paths:
-        assert (p.real_wealth_by_year >= -1e-3).all(), \
-            f"negative wealth in path: {p.real_wealth_by_year.min()}"
+        assert (p.real_wealth_by_year >= -1e-3).all()
 
 
 def test_failure_monotone_in_spending():
-    # Higher spending -> at least as many failures.
     r1 = simulate(_basic_scenario(spending=40_000))
     r2 = simulate(_basic_scenario(spending=80_000))
     assert r2.failure_rate() >= r1.failure_rate()
 
 
 def test_state_tax_changes_outcome():
-    # Same scenario, CA vs WA residency. Use lower spending so paths
-    # don't all deplete (collapsed medians don't differentiate).
-    ca = StateTimeline(residency=[StateAssignment("CA", 40, 80)])
-    wa = StateTimeline(residency=[StateAssignment("WA", 40, 80)])
+    """CA-resident-during-FIRE vs WA-resident: WA preserves more wealth."""
+    ca = StateTimeline(
+        residency=[ResidencyPeriod("CA", D(2026, 1, 1), D(2070, 1, 1))],
+        income_sources=[IncomeSource(
+            state="CA", start=D(2026, 1, 1), end=D(2041, 1, 1),
+            gross_annual=200_000, growth_rate=0.03)],
+    )
+    wa = StateTimeline(
+        residency=[ResidencyPeriod("WA", D(2026, 1, 1), D(2070, 1, 1))],
+        income_sources=[IncomeSource(
+            state="WA", start=D(2026, 1, 1), end=D(2041, 1, 1),
+            gross_annual=200_000, growth_rate=0.03)],
+    )
     r_ca = simulate(_basic_scenario(spending=40_000, state_timeline=ca))
     r_wa = simulate(_basic_scenario(spending=40_000, state_timeline=wa))
-    # Use mean of real wealth at retirement age (year 15 = age 55) as the
-    # comparison: WA should accumulate more during working years (no
-    # income tax on wages -> larger taxable savings).
+    # Compare wealth at retirement (year 15 = age 55).
     w_ca = np.mean([p.real_wealth_by_year[15] for p in r_ca.paths])
     w_wa = np.mean([p.real_wealth_by_year[15] for p in r_wa.paths])
-    assert w_wa > w_ca, f"WA ({w_wa}) should beat CA ({w_ca}) at retirement"
+    assert w_wa > w_ca, f"WA ({w_wa:,.0f}) should beat CA ({w_ca:,.0f})"
+
+
+def test_mid_year_state_move():
+    """Move from CA to WA on July 1 of a year: tax falls partway between
+    full-CA-year and full-WA-year."""
+    full_ca = StateTimeline(
+        residency=[ResidencyPeriod("CA", D(2026, 1, 1), D(2070, 1, 1))],
+        income_sources=[IncomeSource(
+            state="CA", start=D(2026, 1, 1), end=D(2041, 1, 1),
+            gross_annual=200_000, growth_rate=0.03)],
+    )
+    full_wa = StateTimeline(
+        residency=[ResidencyPeriod("WA", D(2026, 1, 1), D(2070, 1, 1))],
+        income_sources=[IncomeSource(
+            state="WA", start=D(2026, 1, 1), end=D(2041, 1, 1),
+            gross_annual=200_000, growth_rate=0.03)],
+    )
+    mid = StateTimeline(
+        residency=[
+            ResidencyPeriod("CA", D(2026, 1, 1), D(2030, 7, 1)),
+            ResidencyPeriod("WA", D(2030, 7, 1), D(2070, 1, 1)),
+        ],
+        income_sources=[
+            IncomeSource("CA", D(2026, 1, 1), D(2030, 7, 1),
+                         gross_annual=200_000, growth_rate=0.03),
+            IncomeSource("WA", D(2030, 7, 1), D(2041, 1, 1),
+                         gross_annual=200_000, growth_rate=0.03),
+        ],
+    )
+    r_ca = simulate(_basic_scenario(spending=40_000, state_timeline=full_ca))
+    r_wa = simulate(_basic_scenario(spending=40_000, state_timeline=full_wa))
+    r_mid = simulate(_basic_scenario(spending=40_000, state_timeline=mid))
+    w_ca = np.mean([p.real_wealth_by_year[15] for p in r_ca.paths])
+    w_wa = np.mean([p.real_wealth_by_year[15] for p in r_wa.paths])
+    w_mid = np.mean([p.real_wealth_by_year[15] for p in r_mid.paths])
+    assert w_ca <= w_mid <= w_wa, (
+        f"mid-year move ({w_mid:,.0f}) should sit between full-CA "
+        f"({w_ca:,.0f}) and full-WA ({w_wa:,.0f})")
+
+
+def test_multiple_income_sources():
+    """Two concurrent jobs in different states: wages stack, both get taxed."""
+    tl = StateTimeline(
+        residency=[ResidencyPeriod("CA", D(2026, 1, 1), D(2070, 1, 1))],
+        income_sources=[
+            IncomeSource("CA", D(2026, 1, 1), D(2041, 1, 1),
+                         gross_annual=100_000, growth_rate=0.03),
+            IncomeSource("OR", D(2026, 1, 1), D(2030, 1, 1),
+                         gross_annual=50_000, growth_rate=0.0),
+        ],
+    )
+    # Just confirm it runs and produces some wealth growth.
+    r = simulate(_basic_scenario(spending=40_000, state_timeline=tl))
+    assert r.paths[0].real_wealth_by_year[5] > r.paths[0].real_wealth_by_year[0]
 
 
 def test_mega_backdoor_increases_roth():
-    """With mega-backdoor enabled, the Roth balance at retirement age should
-    be noticeably higher than without."""
     no_mbdr = _basic_scenario(spending=40_000, n_paths=50,
                                contributions=Contributions(
                                    trad_401k=23_000, mega_backdoor_roth=0))
@@ -105,30 +177,22 @@ def test_mega_backdoor_increases_roth():
                                      mega_backdoor_roth=20_000))
     r_no = simulate(no_mbdr)
     r_yes = simulate(with_mbdr)
-    # Compare wealth at retirement (year 15 = age 55), before withdrawals
-    # erode it.
     w_no = np.mean([p.real_wealth_by_year[15] for p in r_no.paths])
     w_yes = np.mean([p.real_wealth_by_year[15] for p in r_yes.paths])
     assert w_yes > w_no
 
 
 def test_5y_clock_protects_fresh_conversions():
-    """Pre-59.5 withdrawals from a Roth should hit the penalty if
-    conversions are < 5 years old. We test the vstate.withdraw_roth helper
-    directly because it's deterministic at that level."""
     from retire.vstate import withdraw_roth
     s = VState.from_portfolio(_basic_scenario().initial_portfolio,
                                n_paths=2, horizon=20,
                                starting_nominal_income=200_000)
-    # Inject a conversion at year 3
     s.roth_conversions[:, 3] = 50_000.0
-    s.roth_balance[:, 0] += 50_000.0  # increase balance accordingly
-    s.roth_basis[:] = 0.0  # zero basis so withdrawal hits conversion
-    # Withdraw at year 5 (only 2 years after conversion, age 45 -> early)
+    s.roth_balance[:, 0] += 50_000.0
+    s.roth_basis[:] = 0.0
     proc, ord_add, pen = withdraw_roth(s, np.array([10_000.0, 10_000.0]),
                                         year_idx=5, age=45)
-    # Pre-59.5 withdrawal of green conversion -> 10% penalty on principal.
-    assert (pen > 0).all(), f"expected penalty, got {pen}"
+    assert (pen > 0).all()
     assert math.isclose(pen[0], 1_000.0, rel_tol=1e-9)
 
 
@@ -137,23 +201,19 @@ def test_5y_clock_mature_conversion_no_penalty():
     s = VState.from_portfolio(_basic_scenario().initial_portfolio,
                                n_paths=2, horizon=20,
                                starting_nominal_income=200_000)
-    s.roth_conversions[:, 0] = 50_000.0  # conversion at year 0
+    s.roth_conversions[:, 0] = 50_000.0
     s.roth_balance[:, 0] += 50_000.0
     s.roth_basis[:] = 0.0
-    # Withdraw at year 6 (>= 5 years after) -> no penalty even pre-59.5
     proc, ord_add, pen = withdraw_roth(s, np.array([10_000.0, 10_000.0]),
                                         year_idx=6, age=45)
     assert (pen == 0).all()
 
 
 def test_withdraw_roth_basis_first_no_penalty():
-    """Direct contributions are always penalty-free regardless of clock."""
     from retire.vstate import withdraw_roth
     s = VState.from_portfolio(_basic_scenario().initial_portfolio,
                                n_paths=1, horizon=20,
                                starting_nominal_income=200_000)
-    # Roth basis starts at 50k from the basic scenario; conversions at 0.
-    # Withdraw 30k at age 45 (early) — should come from basis, no penalty.
     proc, ord_add, pen = withdraw_roth(s, np.array([30_000.0]),
                                         year_idx=2, age=45)
     assert math.isclose(proc[0], 30_000.0, rel_tol=1e-9)

@@ -1,12 +1,19 @@
 """YAML config schema with validation.
 
-Configuration is intentionally explicit; defaults live here, not scattered
-across the simulator. The `Scenario` is the single object passed to the
-simulation and optimizer."""
+The simulator runs on calendar dates, anchored to `profile.start_date`.
+Each simulation year y is the window [start_date + y years, start_date + (y+1) years).
+Residency periods and income sources carry explicit YYYY-MM-DD start/end
+dates; partial-year overlaps are weighted by fraction of the year.
+
+Backward-compatible age-based shorthand: if you provide `age`,
+`retirement_age`, `end_of_plan_age` instead of dates, they are converted
+using `start_date` (default = today) and an inferred `birthdate`.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+import datetime as _dt
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -16,28 +23,36 @@ import yaml
 from .accounts import (Asset, AccountType, Lot, Portfolio,
                        TaxableAccount, TaxAdvantagedAccount)
 from .returns import AssetParams, MarketModel
-from .state_taxes import StateTimeline, StateAssignment
+from .state_taxes import (StateTimeline, ResidencyPeriod, IncomeSource,
+                          DAYS_PER_YEAR, _add_years)
 from .taxes import FilingStatus
 
 
 @dataclass
 class Profile:
-    age: int
-    retirement_age: int
-    end_of_plan_age: int
+    birthdate: _dt.date
+    start_date: _dt.date
+    retirement_date: _dt.date
+    end_of_plan_date: _dt.date
     filing_status: FilingStatus = "single"
 
+    @property
+    def age(self) -> float:
+        """Age in years at simulation start."""
+        return (self.start_date - self.birthdate).days / DAYS_PER_YEAR
+
+    def age_at_year(self, year_idx: int) -> float:
+        """Fractional age at the start of simulation year `year_idx`."""
+        d = _add_years(self.start_date, year_idx)
+        return (d - self.birthdate).days / DAYS_PER_YEAR
+
     def years_to_retirement(self) -> int:
-        return max(0, self.retirement_age - self.age)
+        return max(0, int(round(
+            (self.retirement_date - self.start_date).days / DAYS_PER_YEAR)))
 
     def horizon(self) -> int:
-        return self.end_of_plan_age - self.age
-
-
-@dataclass
-class Income:
-    current_gross: float
-    growth_rate: float = 0.03  # nominal
+        return int(round(
+            (self.end_of_plan_date - self.start_date).days / DAYS_PER_YEAR))
 
 
 @dataclass
@@ -47,20 +62,24 @@ class Contributions:
     to taxable.
 
     `mega_backdoor_roth` is the after-tax 401k contribution that gets
-    immediately converted to Roth (in-plan or via in-service distribution).
-    Limit = $69,000 (2024 415(c) total) - employee_pretax - employer_match.
+    immediately converted to Roth. Limit = $69,000 (2024 415(c) total)
+    minus employee pre-tax minus employer match.
     """
     trad_401k: float | str = 0.0
     roth_401k: float | str = 0.0
     trad_ira: float | str = 0.0
     roth_ira: float | str = 0.0
     mega_backdoor_roth: float | str = 0.0
-    employer_match_rate: float = 0.0  # employer matches X * gross, deposited to traditional 401k
+    employer_match_rate: float = 0.0
 
 
 @dataclass
 class Savings:
-    rate: float  # of gross income
+    """`rate` is the fraction of *total nominal wages* (across all active
+    income sources) that gets saved. Anything not saved is implied living
+    expense; tax is paid out of saved-or-taken-home cash before any taxable
+    deposit happens."""
+    rate: float
     contributions: Contributions = field(default_factory=Contributions)
 
 
@@ -74,19 +93,12 @@ class SocialSecurity:
 class Spending:
     annual_real: float
     smile: Literal["flat", "bengen"] = "flat"
-    # bengen: -1% real per year for 10y after retirement, then flat, then +1%/yr
-    # for healthcare from age 80
 
 
 @dataclass
 class WithdrawalPolicy:
     strategy: Literal["tax_aware", "ordered", "proportional"] = "tax_aware"
-    # Roth conversion: each year, convert traditional -> Roth up to filling
-    # this marginal bracket from the top. 0.12 means "fill the 12% bracket".
-    # None disables conversions.
     roth_conversion_target_bracket: float | None = 0.12
-    # Stop conversions before this MAGI to avoid ACA cliff (only relevant
-    # before Medicare age 65). Set to None to disable.
     aca_magi_cap: float | None = None
 
 
@@ -118,7 +130,6 @@ class MarketConfig:
 
 @dataclass
 class Allocation:
-    """Target allocation for a single account. Fractions sum to 1."""
     stock: float
     bond: float
     cash: float
@@ -153,17 +164,18 @@ class SimulationParams:
 @dataclass
 class Scenario:
     profile: Profile
-    income: Income
+    state_taxes: StateTimeline
     savings: Savings
     spending: Spending
     initial_portfolio: Portfolio
     target_allocations: TargetAllocations
     market: MarketConfig
-    state_taxes: StateTimeline = field(default_factory=StateTimeline)
     social_security: SocialSecurity = field(default_factory=SocialSecurity)
     withdrawal: WithdrawalPolicy = field(default_factory=WithdrawalPolicy)
     simulation: SimulationParams = field(default_factory=SimulationParams)
 
+
+# ---------- YAML helpers ----------
 
 def _make_lot(d: dict[str, Any]) -> Lot:
     return Lot(asset=Asset(d["asset"]),
@@ -192,17 +204,107 @@ def _make_allocation(d: dict[str, Any]) -> Allocation:
                       cash=float(d["cash"]))
 
 
+def _to_date(v: Any) -> _dt.date:
+    """Accept date, datetime, or 'YYYY-MM-DD' string."""
+    if isinstance(v, _dt.date) and not isinstance(v, _dt.datetime):
+        return v
+    if isinstance(v, _dt.datetime):
+        return v.date()
+    if isinstance(v, str):
+        return _dt.date.fromisoformat(v)
+    raise TypeError(f"expected date or 'YYYY-MM-DD' string, got {type(v).__name__}")
+
+
+def _parse_profile(raw: dict[str, Any]) -> Profile:
+    """Date-based or age-based form. Date-based fields take precedence."""
+    fs = raw.get("filing_status", "single")
+    if "birthdate" in raw or "start_date" in raw:
+        if "birthdate" not in raw:
+            raise ValueError("date-based profile requires `birthdate`")
+        bd = _to_date(raw["birthdate"])
+        sd = _to_date(raw.get("start_date", _dt.date.today()))
+        rd = _to_date(raw["retirement_date"])
+        ed = _to_date(raw["end_of_plan_date"])
+        return Profile(birthdate=bd, start_date=sd, retirement_date=rd,
+                       end_of_plan_date=ed, filing_status=fs)
+    # Legacy age-based form
+    if "age" not in raw:
+        raise ValueError("profile must specify either dates (birthdate, "
+                         "retirement_date, end_of_plan_date) or ages "
+                         "(age, retirement_age, end_of_plan_age)")
+    today = _dt.date.today()
+    age = int(raw["age"])
+    bd = _add_years(today, -age)
+    rd = _add_years(today, int(raw["retirement_age"]) - age)
+    ed = _add_years(today, int(raw["end_of_plan_age"]) - age)
+    return Profile(birthdate=bd, start_date=today, retirement_date=rd,
+                   end_of_plan_date=ed, filing_status=fs)
+
+
+def _parse_state_timeline(raw: dict[str, Any], income_raw: dict[str, Any] | list,
+                          profile: Profile) -> StateTimeline:
+    """Build the StateTimeline from `state_taxes` and `income.sources` blocks.
+
+    Backward-compatible shorthand:
+      state_taxes: {state: CA}        -> CA residency for full plan
+      state_taxes:
+        residency:
+          - {state: CA, start: 2026-05-05, end: 2030-08-01}
+          - {state: WA, start: 2030-08-01, end: 2086-05-05}
+    """
+    timeline = StateTimeline()
+
+    # --- Residency periods ---
+    if isinstance(raw, dict) and raw.get("state"):
+        # Shorthand: one state for the whole plan.
+        timeline.residency.append(ResidencyPeriod(
+            state=raw["state"], start=profile.start_date,
+            end=_add_years(profile.end_of_plan_date, 1)))
+    if isinstance(raw, dict) and "residency" in raw:
+        for entry in raw["residency"]:
+            timeline.residency.append(ResidencyPeriod(
+                state=entry["state"],
+                start=_to_date(entry["start"]),
+                end=_to_date(entry["end"]),
+            ))
+
+    # --- Income sources ---
+    sources_raw: list[dict[str, Any]] = []
+    if isinstance(income_raw, list):
+        sources_raw = income_raw
+    elif isinstance(income_raw, dict):
+        sources_raw = income_raw.get("sources", [])
+        # Legacy single-source form: income: {current_gross, growth_rate, ...}
+        if not sources_raw and "current_gross" in income_raw:
+            employment_state = (raw.get("state") if isinstance(raw, dict)
+                                else None) or "NONE"
+            sources_raw = [{
+                "state": employment_state,
+                "start": profile.start_date,
+                "end": profile.retirement_date,
+                "gross_annual": float(income_raw["current_gross"]),
+                "growth_rate": float(income_raw.get("growth_rate", 0.0)),
+            }]
+    for src in sources_raw:
+        timeline.income_sources.append(IncomeSource(
+            state=src["state"],
+            start=_to_date(src["start"]),
+            end=_to_date(src["end"]),
+            gross_annual=float(src["gross_annual"]),
+            growth_rate=float(src.get("growth_rate", 0.0)),
+        ))
+    return timeline
+
+
 def load_scenario(path: str | Path) -> Scenario:
     """Parse a YAML scenario file."""
     with open(path) as f:
         raw = yaml.safe_load(f)
 
-    profile = Profile(**raw["profile"])
-    income = Income(**raw["income"])
+    profile = _parse_profile(raw["profile"])
 
     sav_raw = raw["savings"]
-    contribs_raw = sav_raw.get("contributions", {})
-    contribs = Contributions(**contribs_raw)
+    contribs = Contributions(**sav_raw.get("contributions", {}))
     savings = Savings(rate=float(sav_raw["rate"]), contributions=contribs)
 
     spending = Spending(**raw["spending"])
@@ -231,39 +333,13 @@ def load_scenario(path: str | Path) -> Scenario:
     wd = WithdrawalPolicy(**raw.get("withdrawal", {}))
     sim = SimulationParams(**raw.get("simulation", {}))
 
-    # State tax timeline. Two forms accepted:
-    #   state_taxes:
-    #     residency: [{state: CA, start_age: 35, end_age: 50}, ...]
-    #     employment: [...]
-    # Or shorthand:
-    #   state_taxes:
-    #     state: CA   -> applied as both residency and employment for whole life
-    st_raw = raw.get("state_taxes", {})
-    timeline = StateTimeline()
-    if "state" in st_raw:
-        s = st_raw["state"]
-        timeline.residency.append(
-            StateAssignment(state=s, start_age=profile.age,
-                            end_age=profile.end_of_plan_age + 1))
-        timeline.employment.append(
-            StateAssignment(state=s, start_age=profile.age,
-                            end_age=profile.retirement_age))
-    if "residency" in st_raw:
-        for entry in st_raw["residency"]:
-            timeline.residency.append(StateAssignment(
-                state=entry["state"], start_age=int(entry["start_age"]),
-                end_age=int(entry["end_age"]),
-                weight=float(entry.get("weight", 1.0))))
-    if "employment" in st_raw:
-        for entry in st_raw["employment"]:
-            timeline.employment.append(StateAssignment(
-                state=entry["state"], start_age=int(entry["start_age"]),
-                end_age=int(entry["end_age"]),
-                weight=float(entry.get("weight", 1.0))))
+    timeline = _parse_state_timeline(
+        raw.get("state_taxes", {}), raw.get("income", {}), profile)
 
     return Scenario(
-        profile=profile, income=income, savings=savings, spending=spending,
+        profile=profile, state_taxes=timeline,
+        savings=savings, spending=spending,
         initial_portfolio=portfolio, target_allocations=targets,
-        market=market, state_taxes=timeline,
+        market=market,
         social_security=ss, withdrawal=wd, simulation=sim,
     )

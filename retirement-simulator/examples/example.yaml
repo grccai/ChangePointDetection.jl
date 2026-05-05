@@ -1,33 +1,33 @@
-# Example scenario: 35-year-old single filer, FIRE at 50, plan to age 95.
+# Example scenario: 35-year-old single filer, FIRE around 50, plan to age 95.
 # All dollar values are in TODAY'S dollars unless explicitly nominal.
-# Real returns are post-inflation; the inflation_mean below converts them
-# to nominal internally as needed.
+# Real returns are post-inflation.
 
 profile:
-  age: 35
-  retirement_age: 50
-  end_of_plan_age: 95
-  filing_status: single        # 'single' or 'mfj'
+  birthdate:        1991-04-15      # determines age throughout the plan
+  start_date:       2026-05-05      # first simulated year starts here
+  retirement_date:  2041-05-05      # FIRE
+  end_of_plan_date: 2086-05-05      # end of horizon
+  filing_status:    single          # 'single' or 'mfj'
 
-# State income tax. Two equivalent forms:
-#   Shorthand (one state your whole life):
-#     state_taxes: {state: CA}
-#   Full form (multi-state with optional overlap):
+# Each income source has a state, [start, end), an annual gross amount in
+# year-1 dollars, and an annual growth_rate (nominal). Multiple concurrent
+# sources stack; mid-year transitions pro-rate by fraction-of-year.
+income:
+  sources:
+    - {state: CA, start: 2026-05-05, end: 2030-08-01, gross_annual: 200000, growth_rate: 0.03}
+    - {state: WA, start: 2030-08-01, end: 2041-05-05, gross_annual: 250000, growth_rate: 0.025}
+    # Side gig: half-time consulting in OR for two years overlapping the WA job.
+    - {state: OR, start: 2032-01-01, end: 2034-01-01, gross_annual:  60000, growth_rate: 0.0}
+
+# Where you LIVE (taxes investment income, RMDs, conversions). Independent
+# of where you WORK (which is per income source).
 state_taxes:
   residency:
-    - {state: CA, start_age: 35, end_age: 50}      # live in CA while working
-    - {state: WA, start_age: 50, end_age: 95}      # move to WA at FIRE
-  employment:
-    - {state: CA, start_age: 35, end_age: 45}      # work in CA
-    - {state: WA, start_age: 45, end_age: 50, weight: 0.5}  # split job at 45
-    - {state: CA, start_age: 45, end_age: 50, weight: 0.5}
-
-income:
-  current_gross: 200000
-  growth_rate: 0.03            # nominal (combine real growth + inflation)
+    - {state: CA, start: 2026-05-05, end: 2030-08-01}     # while working in CA
+    - {state: WA, start: 2030-08-01, end: 2086-05-05}     # move to WA, stay forever
 
 savings:
-  rate: 0.40                   # 40% of gross saved (after-tax living budget = 60% of gross less tax)
+  rate: 0.40                   # 40% of total gross wages
   contributions:
     trad_401k: max             # max out (uses IRS limit + catchup if 50+)
     roth_401k: 0
@@ -36,33 +36,27 @@ savings:
     mega_backdoor_roth: max    # after-tax 401k -> Roth (up to 415(c) limit)
     employer_match_rate: 0.05  # 5% of gross matched into traditional 401k
 
-# Annual real spending in retirement (today's dollars). Inflation-adjusted
-# automatically.
 spending:
   annual_real: 80000
   smile: bengen                # 'flat' or 'bengen'
 
 initial_portfolio:
-  # Taxable: explicit lots so cost basis and holding-period are tracked.
   taxable:
     lots:
       - {asset: stock, market_value: 150000, cost_basis: 90000, age_years: 3.0}
       - {asset: stock, market_value:   5000, cost_basis:  5000, age_years: 0.4}  # ST
       - {asset: bond,  market_value:  30000, cost_basis: 28000, age_years: 2.0}
       - {asset: cash,  market_value:  20000, cost_basis: 20000, age_years: 5.0}
-  traditional:                 # 401k + IRA combined
+  traditional:
     stock: 250000
     bond:   50000
     cash:       0
-  roth:                        # Roth IRA + Roth 401k combined
+  roth:
     stock:  80000
     bond:       0
     cash:       0
-    basis:  35000              # contributions to date (withdrawable any time)
+    basis:  35000              # contributions to date
 
-# Target allocations PER ACCOUNT (each row sums to 1).
-# Asset *location* matters: bonds in traditional, stocks in Roth/taxable
-# is the textbook tax-efficient default.
 target_allocations:
   taxable:
     stock: 0.85
@@ -77,24 +71,22 @@ target_allocations:
     bond: 0.00
     cash: 0.00
 
-# Real (post-inflation) expected returns. Volatilities are real annualized.
-# Defaults are conservative long-run estimates; tune to your priors.
 market:
   stocks: {real_return: 0.06, vol: 0.18}
   bonds:  {real_return: 0.02, vol: 0.06}
   cash:   {real_return: 0.005, vol: 0.01}
   inflation_mean: 0.025
-  inflation_vol: 0.0           # set >0 for stochastic inflation
+  inflation_vol: 0.0
   correlation_stock_bond: 0.10
   correlation_stock_cash: 0.0
   correlation_bond_cash: 0.0
 
 social_security:
-  monthly_at_67: 2500          # nominal-today; COLA'd by inflation
+  monthly_at_67: 2500
   claim_age: 67
 
 withdrawal:
-  strategy: tax_aware          # tax_aware | proportional | ordered
+  strategy: tax_aware
   roth_conversion_target_bracket: 0.12
   aca_magi_cap: 50000          # null disables ACA cliff awareness
 

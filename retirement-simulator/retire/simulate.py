@@ -19,7 +19,8 @@ from .accounts import Asset
 from .config import (Scenario, Allocation, TargetAllocations,
                      WithdrawalPolicy, Spending)
 from .returns import sample_gbm_paths, sample_inflation
-from .state_taxes import (StateTimeline, multi_state_tax_vec, state_tax_vec)
+from .state_taxes import (StateTimeline, state_tax_vec, state_wages_tax,
+                          state_residency_tax_vec)
 from .taxes import (TAX_2024, TaxYear, FilingStatus, Bracket,
                     progressive_tax, ltcg_tax, taxable_social_security,
                     niit_owed, required_min_distribution, top_of_bracket,
@@ -193,8 +194,10 @@ def simulate(scn: Scenario,
                   returns_by_asset[Asset.BOND],
                   returns_by_asset[Asset.CASH]], axis=-1)  # (P, H, 3)
 
+    # Starting nominal income = total wages in the first simulation year.
+    starting_wages = scn.state_taxes.total_wages(scn.profile.start_date, 0)
     s = VState.from_portfolio(scn.initial_portfolio, P, horizon,
-                              starting_nominal_income=scn.income.current_gross)
+                              starting_nominal_income=starting_wages)
 
     targets_taxable = _alloc_to_array(scn.target_allocations.taxable)
     targets_trad = _alloc_to_array(scn.target_allocations.traditional)
@@ -204,15 +207,18 @@ def simulate(scn: Scenario,
     yf = np.array([market.yield_fraction[a] for a in ASSET_ORDER])
 
     fs = scn.profile.filing_status
-    timeline: StateTimeline = scn.state_taxes  # see config update below
+    timeline: StateTimeline = scn.state_taxes
+    sim_start = scn.profile.start_date
+    retirement_age = (scn.profile.retirement_date - scn.profile.birthdate
+                      ).days / 365.25
 
     for y in range(horizon):
-        age = scn.profile.age + y
+        age = scn.profile.age_at_year(y)
         ret_y = R[:, y, :]   # (P, 3)
         infl_y = inflation[:, y]  # (P,)
         s.cumulative_inflation *= (1.0 + infl_y)
 
-        if age < scn.profile.retirement_age:
+        if age < retirement_age:
             _step_accumulation(s, scn, age, y, ret_y, fs, timeline,
                                targets_taxable, targets_trad, targets_roth, yf)
         else:
@@ -220,8 +226,7 @@ def simulate(scn: Scenario,
                                targets_taxable, targets_trad, targets_roth, yf)
         s.age_st_to_lt()
         s.real_wealth[:, y + 1] = s.total_value() / s.cumulative_inflation
-        # Mark failed paths (zero wealth past retirement counts as failure)
-        if age >= scn.profile.retirement_age:
+        if age >= retirement_age:
             s.failed |= (s.total_value() <= 0)
 
     # Build per-path PathResult objects from arrays
@@ -240,124 +245,99 @@ def simulate(scn: Scenario,
 
 # ---------- Per-year accumulation step ----------
 
-def _step_accumulation(s: VState, scn: Scenario, age: int, year_idx: int,
+def _step_accumulation(s: VState, scn: Scenario, age: float, year_idx: int,
                        returns_y: np.ndarray, fs: FilingStatus,
                        timeline: StateTimeline,
                        tgt_tax: np.ndarray, tgt_trad: np.ndarray,
                        tgt_roth: np.ndarray, yf: np.ndarray) -> None:
     """Vectorised accumulation year, in-place mutation of s."""
-    # 1) Income grows (year_idx > 0 only; year 0 keeps starting income)
-    if year_idx > 0:
-        s.nominal_income *= (1.0 + scn.income.growth_rate)
+    sim_start = scn.profile.start_date
+    P = s.n_paths
 
-    # 2) Returns: stock/bond/cash. Yield gets sold/reinvested as new ST cohort
-    # in taxable; tax-advantaged just compound.
+    # 1) Wages this year by employment state (mid-year transitions handled
+    # by fraction-of-year overlap).
+    wages_by_state = timeline.wages_by_state(sim_start, year_idx)
+    total_wages = sum(wages_by_state.values())
+    s.nominal_income[:] = total_wages
+
+    # 2) Returns + yield decomposition (taxable yield -> new ST cohort)
     s.trad_balance *= (1.0 + returns_y)
     s.roth_balance *= (1.0 + returns_y)
-
-    pos_ret = np.maximum(0.0, returns_y)         # (P, 3)
-    yield_amt_lt = s.tax_lt_value * pos_ret * yf  # (P, 3)
+    pos_ret = np.maximum(0.0, returns_y)
+    yield_amt_lt = s.tax_lt_value * pos_ret * yf
     yield_amt_st = s.tax_st_value * pos_ret * yf
-    appreciation = returns_y - pos_ret * yf       # (P, 3)
+    appreciation = returns_y - pos_ret * yf
     s.tax_lt_value *= (1.0 + appreciation)
     s.tax_st_value *= (1.0 + appreciation)
-    yield_amt = yield_amt_lt + yield_amt_st       # (P, 3) total dividend cash
+    yield_amt = yield_amt_lt + yield_amt_st
     s.tax_st_value += yield_amt
     s.tax_st_basis += yield_amt
-    qual_div = yield_amt[:, 0]                    # stocks
-    ord_div = yield_amt[:, 1] + yield_amt[:, 2]   # bonds + cash
+    qual_div = yield_amt[:, 0]
+    ord_div = yield_amt[:, 1] + yield_amt[:, 2]
 
-    # 3) Contributions
+    # 3) Contributions (subject to IRS limits + age 50 catchup)
     catchup_401k = TAX_2024.contrib_limit_401k_catchup if age >= 50 else 0.0
     catchup_ira = TAX_2024.contrib_limit_ira_catchup if age >= 50 else 0.0
     limit_401k = TAX_2024.contrib_limit_401k + catchup_401k
     limit_ira = TAX_2024.contrib_limit_ira + catchup_ira
-    # 415(c) overall annual additions limit (for mega-backdoor):
-    # 2024 = $69,000 + catchup. Approximate as 69k regardless of age (catchup
-    # is in trad limit already).
     total_415c = 69_000.0 + catchup_401k
 
     c = scn.savings.contributions
-    trad_401k = min(_resolve_contrib_value(c.trad_401k, limit_401k), limit_401k)
+    trad_401k = min(_resolve_contrib_value(c.trad_401k, limit_401k), limit_401k,
+                    total_wages)
     roth_401k_room = max(0.0, limit_401k - trad_401k)
     roth_401k = min(_resolve_contrib_value(c.roth_401k, roth_401k_room),
                     roth_401k_room)
     trad_ira = min(_resolve_contrib_value(c.trad_ira, limit_ira), limit_ira)
     roth_ira = min(_resolve_contrib_value(c.roth_ira, limit_ira - trad_ira),
                    limit_ira - trad_ira)
-    employer_match = c.employer_match_rate * s.nominal_income  # (P,) — pre-tax
-
-    # Mega-backdoor Roth: post-tax 401k -> Roth conversion within plan.
-    # Limited to 415(c) - employee_pretax - employer_match (approx).
-    # Configured as a fixed dollar amount or 'max'.
-    mbdr_room = np.maximum(
-        0.0, total_415c - trad_401k - roth_401k - employer_match)
+    employer_match = c.employer_match_rate * total_wages
+    mbdr_room = max(0.0, total_415c - trad_401k - roth_401k - employer_match)
     if isinstance(c.mega_backdoor_roth, str) and c.mega_backdoor_roth == "max":
-        mbdr = mbdr_room  # (P,)
+        mbdr = mbdr_room
     else:
-        mbdr = np.full(s.n_paths, float(c.mega_backdoor_roth))
-        mbdr = np.minimum(mbdr, mbdr_room)
+        mbdr = min(float(c.mega_backdoor_roth), mbdr_room)
 
-    # Deposit pre-tax contributions (Traditional 401k + employer + Trad IRA)
-    pretax_trad = trad_401k + trad_ira  # scalar
+    pretax_trad = trad_401k + trad_ira
     s.trad_balance += pretax_trad * tgt_trad[None, :]
-    s.trad_balance += employer_match[:, None] * tgt_trad[None, :]
-    # Roth contributions
-    roth_direct = roth_401k + roth_ira  # scalar
+    s.trad_balance += employer_match * tgt_trad[None, :]
+    roth_direct = roth_401k + roth_ira
     s.roth_balance += roth_direct * tgt_roth[None, :]
     s.roth_basis += roth_direct
-    # Mega-backdoor: post-tax money going into Roth — counts as Roth basis
-    # (technically as conversion-of-after-tax with its own 5y clock; we model
-    # as basis since both are penalty-free principal).
-    s.roth_balance += mbdr[:, None] * tgt_roth[None, :]
+    s.roth_balance += mbdr * tgt_roth[None, :]
     s.roth_basis += mbdr
 
-    # 4) Income tax
-    # Wages-only (subject to employment-state tax).
-    wages = s.nominal_income - trad_401k - trad_ira  # post-pre-tax wages
-    wages = np.maximum(wages, 0.0)
-    # Mega-backdoor isn't deducted from W-2 wages (it's already after-tax
-    # deferral); modeled as paid out of take-home.
-    ord_income_fed = wages + ord_div  # ordinary income for federal
-    ltcg_income = qual_div  # qualified divs at LTCG rates
-
+    # 4) Tax bill
+    # Federal: ordinary base = wages_after_pretax + ord_div; LTCG = qual_div.
+    wages_after_pretax = max(0.0, total_wages - pretax_trad)
+    ord_income_fed = wages_after_pretax + ord_div
+    ltcg_income = qual_div
     fed_tax, _ = _federal_tax_vec(ord_income_fed, ltcg_income,
-                                  np.zeros(s.n_paths), fs)
-    # State tax: split wages from other income for multi-state residency.
-    state_tax = multi_state_tax_vec(
-        ordinary_income_wages=wages,
-        ordinary_income_other=ord_div,
-        ltcg_income=ltcg_income,
-        age=age, filing_status=fs, timeline=timeline,
-    )
-    bill_total = fed_tax + state_tax
+                                  np.zeros(P), fs)
+    # State tax: wages by employment state (apportioning pretax_401k);
+    # plus residency tax on dividends.
+    state_wage_tax_scalar = state_wages_tax(
+        wages_by_state=wages_by_state, pretax_401k=pretax_trad,
+        filing_status=fs)
+    residency_w = timeline.residency_weights(sim_start, year_idx)
+    state_inv_tax = state_residency_tax_vec(
+        residency_weights=residency_w, ordinary_other=ord_div,
+        ltcg=qual_div, filing_status=fs)
+    state_tax_total = state_wage_tax_scalar + state_inv_tax  # (P,)
+    bill_total = fed_tax + state_tax_total
 
-    # 5) Take-home and taxable savings
-    take_home = (s.nominal_income - trad_401k - trad_ira - roth_direct
+    # 5) Take-home and residual taxable savings
+    take_home = (total_wages - trad_401k - trad_ira - roth_direct
                  - mbdr - bill_total)
-    implied_living = (1.0 - scn.savings.rate) * s.nominal_income
+    implied_living = (1.0 - scn.savings.rate) * total_wages
     taxable_savings = np.maximum(0.0, take_home - implied_living)
-    deposit_taxable_st_split(s, taxable_savings, tgt_taxable_array(tgt_tax))
+    deposit_taxable_st_split(s, taxable_savings, tgt_tax)
 
-    # 6) Pay tax on dividends generated this year out of taxable cash if any.
-    # Already included in bill_total but we deduct that amount from cash
-    # explicitly (it's been "spent" on taxes).
-    # Reduce taxable account by tax owed (paid from cash first, etc.)
-    _, _, _ = withdraw_taxable_for_spending(s, np.zeros(s.n_paths))
-    # The tax was already included in `take_home` above; no additional sale
-    # is needed during accumulation since wages cover it.
-
-    # 7) Rebalance tax-advantaged to target (free)
+    # 6) Rebalance tax-advantaged
     _rebalance_to_target(s.trad_balance, tgt_trad)
     _rebalance_to_target(s.roth_balance, tgt_roth)
 
-    # 8) Outputs
     s.real_taxes[:, year_idx] = bill_total / s.cumulative_inflation
-
-
-def tgt_taxable_array(arr: np.ndarray) -> np.ndarray:
-    """Identity helper to make intent clear at call sites."""
-    return arr
 
 
 def _rebalance_to_target(balances: np.ndarray, target: np.ndarray) -> None:
@@ -370,13 +350,14 @@ def _rebalance_to_target(balances: np.ndarray, target: np.ndarray) -> None:
 
 # ---------- Per-year decumulation step ----------
 
-def _step_decumulation(s: VState, scn: Scenario, age: int, year_idx: int,
+def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
                        returns_y: np.ndarray, fs: FilingStatus,
                        timeline: StateTimeline,
                        tgt_tax: np.ndarray, tgt_trad: np.ndarray,
                        tgt_roth: np.ndarray, yf: np.ndarray) -> None:
     """Vectorised decumulation year, in-place mutation of s."""
     P = s.n_paths
+    sim_start = scn.profile.start_date
     # 1) Returns
     s.trad_balance *= (1.0 + returns_y)
     s.roth_balance *= (1.0 + returns_y)
@@ -391,7 +372,9 @@ def _step_decumulation(s: VState, scn: Scenario, age: int, year_idx: int,
     ord_div = yield_amt[:, 1] + yield_amt[:, 2]
 
     # 2) Spending target (real, then nominal)
-    years_into_retire = age - scn.profile.retirement_age
+    retirement_age = (scn.profile.retirement_date - scn.profile.birthdate
+                      ).days / 365.25
+    years_into_retire = max(0, int(round(age - retirement_age)))
     factor = _spending_smile_factor(years_into_retire, scn.spending.smile)
     real_target = scn.spending.annual_real * factor
     s.real_target_spend[:, year_idx] = real_target
@@ -443,15 +426,20 @@ def _step_decumulation(s: VState, scn: Scenario, age: int, year_idx: int,
 
     # 7) Tax bill (federal + state)
     fed_tax, _ = _federal_tax_vec(ord_income, ltcg_income, ss_nominal, fs)
-    # In retirement, no wages -> all "ord_income" is investment-derived,
-    # taxed by state of residence.
-    state_tax = multi_state_tax_vec(
-        ordinary_income_wages=np.zeros(P),
-        ordinary_income_other=ord_income,
-        ltcg_income=ltcg_income,
-        age=age, filing_status=fs, timeline=timeline,
-    )
-    bill_total = fed_tax + state_tax
+    # In retirement: any wages from active income sources still apply
+    # (e.g., post-retirement consulting). Otherwise pure residency-based tax.
+    wages_by_state = timeline.wages_by_state(sim_start, year_idx)
+    if sum(wages_by_state.values()) > 0:
+        state_wage_tax_scalar = state_wages_tax(
+            wages_by_state=wages_by_state, pretax_401k=0.0,
+            filing_status=fs)
+    else:
+        state_wage_tax_scalar = 0.0
+    residency_w = timeline.residency_weights(sim_start, year_idx)
+    state_inv_tax = state_residency_tax_vec(
+        residency_weights=residency_w, ordinary_other=ord_income,
+        ltcg=ltcg_income, filing_status=fs)
+    bill_total = fed_tax + state_wage_tax_scalar + state_inv_tax
 
     # 8) Pay tax: another withdrawal pass for the tax dollars
     paid, lt_g2, st_g2 = withdraw_taxable_for_spending(s, bill_total)

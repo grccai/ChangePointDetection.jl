@@ -1,4 +1,5 @@
-"""US state income tax for CA, WA, and OR (2024).
+"""US state income tax for CA, WA, and OR (2024) and a date-based
+multi-state timeline.
 
 Each state's tax interacts differently with federal:
   * CA: progressive ordinary brackets; LTCG taxed *as ordinary income*
@@ -10,20 +11,20 @@ Each state's tax interacts differently with federal:
         deduction (2023 indexed value; close to 2024). Real estate gains
         and retirement-account distributions are exempt.
 
-Multi-state allocation:
-  * Earned income (wages) is taxed by the state of *employment*.
-  * Investment income (capital gains, dividends, interest, retirement
-    distributions taxable to that state) is taxed by the state of
-    *residence*.
-  * Both timelines support multiple concurrent entries with weights, so
-    you can model a year of half-time work in two states.
-
-This module's vectorised computation is what the simulator uses; the scalar
-form is exposed for tests and for the CLI's one-off `tax` command.
+Multi-state apportionment:
+  * Residency periods carry a state and explicit calendar [start, end) dates.
+    Investment income (capital gains, dividends, RMDs, conversions) is taxed
+    by the residency state(s) active in each simulation year, weighted by
+    fraction of the year resident.
+  * Income sources also carry state and [start, end) dates plus an annual
+    gross amount and a growth rate. Wages from each source are taxed by the
+    source's state. Multiple concurrent sources (e.g., a half-time job in
+    each of two states) are summed.
 """
 
 from __future__ import annotations
 
+import datetime as _dt
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -36,19 +37,17 @@ from .taxes import Bracket, FilingStatus, progressive_tax
 class StateTaxYear:
     state: str
     year: int
-    # Empty list -> no income tax in this state
     ordinary_brackets: dict[str, list[Bracket]]
     std_deduction: dict[str, float]
     # 'ordinary' -> LTCG added to ordinary base (CA, OR)
     # 'separate_flat_threshold' -> WA-style cap-gains tax
-    # 'none' -> no tax on cap gains (most no-income-tax states)
+    # 'none' -> no tax on cap gains
     ltcg_treatment: Literal["ordinary", "separate_flat_threshold", "none"]
-    cgt_threshold: float = 0.0  # for separate_flat_threshold
+    cgt_threshold: float = 0.0
     cgt_rate: float = 0.0
 
 
-# California 2024. The 13.3% top is 12.3% bracket + 1% Mental Health Services
-# Tax. Single thresholds; MFJ brackets are (almost exactly) doubled.
+# California 2024.
 CA_2024 = StateTaxYear(
     state="CA", year=2024,
     ordinary_brackets={
@@ -102,10 +101,7 @@ OR_2024 = StateTaxYear(
     ltcg_treatment="ordinary",
 )
 
-# Washington 2024. No income tax on wages or ordinary investment income.
-# Capital Gains Tax on LT gains > $262,000 (real estate, retirement-account
-# distributions, and a few other categories are exempt — we don't model
-# those exemptions; assume CGT applies to all simulated LT gains).
+# Washington 2024.
 WA_2024 = StateTaxYear(
     state="WA", year=2024,
     ordinary_brackets={"single": [], "mfj": []},
@@ -143,10 +139,9 @@ def state_tax(*, state: str, ordinary_income: float, ltcg_income: float,
     raise ValueError(f"unknown LTCG treatment: {sty.ltcg_treatment}")
 
 
-# ---------- Vectorised forms (used by simulator) ----------
+# ---------- Vectorised forms ----------
 
 def _brackets_to_arrays(brackets: list[Bracket]) -> tuple[np.ndarray, np.ndarray]:
-    """Return (thresholds_with_inf, rates). Thresholds shape (n+1,), rates (n,)."""
     if not brackets:
         return np.array([0.0, np.inf]), np.array([0.0])
     thresh = np.array([b.threshold for b in brackets] + [np.inf])
@@ -156,16 +151,12 @@ def _brackets_to_arrays(brackets: list[Bracket]) -> tuple[np.ndarray, np.ndarray
 
 def progressive_tax_vec(taxable: np.ndarray, brackets: list[Bracket]
                         ) -> np.ndarray:
-    """Vectorised progressive tax. `taxable` is a 1D array of incomes;
-    returns array of same shape with tax owed."""
     thresh, rates = _brackets_to_arrays(brackets)
     if rates.sum() == 0:
         return np.zeros_like(taxable)
-    # For each bracket i: amount = clip(min(taxable, thresh[i+1]) - thresh[i], 0, inf)
-    # Sum over i of amount[i] * rates[i].
     t = np.maximum(0.0, np.asarray(taxable))
-    upper = thresh[1:][None, :]      # (1, n)
-    lower = thresh[:-1][None, :]     # (1, n)
+    upper = thresh[1:][None, :]
+    lower = thresh[:-1][None, :]
     in_bracket = np.clip(np.minimum(t[:, None], upper) - lower, 0.0, None)
     return (in_bracket * rates[None, :]).sum(axis=-1)
 
@@ -173,7 +164,6 @@ def progressive_tax_vec(taxable: np.ndarray, brackets: list[Bracket]
 def state_tax_vec(*, state: str, ordinary_income: np.ndarray,
                   ltcg_income: np.ndarray, filing_status: FilingStatus
                   ) -> np.ndarray:
-    """Vectorised state tax. Returns array of same shape as inputs."""
     sty = STATES[state]
     sd = sty.std_deduction[filing_status]
     if sty.ltcg_treatment == "none":
@@ -189,83 +179,140 @@ def state_tax_vec(*, state: str, ordinary_income: np.ndarray,
     raise ValueError(f"unknown LTCG treatment: {sty.ltcg_treatment}")
 
 
-# ---------- Multi-state timeline ----------
+# ---------- Date-based timeline ----------
+
+DAYS_PER_YEAR = 365.25
+
+
+def _add_years(d: _dt.date, years: int) -> _dt.date:
+    """Add `years` calendar years to `d`. Feb 29 in a leap year maps to
+    Feb 28 in non-leap years."""
+    try:
+        return d.replace(year=d.year + years)
+    except ValueError:
+        return d.replace(year=d.year + years, day=28)
+
+
+def _interval_overlap_days(a_start: _dt.date, a_end: _dt.date,
+                            b_start: _dt.date, b_end: _dt.date) -> int:
+    """Days of overlap between [a_start, a_end) and [b_start, b_end)."""
+    lo = max(a_start, b_start)
+    hi = min(a_end, b_end)
+    delta = (hi - lo).days
+    return max(0, delta)
+
 
 @dataclass
-class StateAssignment:
-    """One entry on a residency or employment timeline. Weights need not sum
-    to 1; they're normalised at evaluation time within (start_age, end_age)."""
+class ResidencyPeriod:
+    """Where the taxpayer lives for tax purposes during [start, end)."""
     state: str
-    start_age: int
-    end_age: int   # exclusive
-    weight: float = 1.0
+    start: _dt.date
+    end: _dt.date
+
+
+@dataclass
+class IncomeSource:
+    """A wage source. `gross_annual` is the year-1 (start-of-source) annual
+    gross. The amount grows at `growth_rate` (nominal, compounded annually)
+    measured from `start`.
+
+    `state` is the state of employment that taxes the wages from this source.
+    Use 'NONE' to exempt this source from state tax (e.g., contract income
+    classified differently)."""
+    state: str
+    start: _dt.date
+    end: _dt.date
+    gross_annual: float
+    growth_rate: float = 0.0
 
 
 @dataclass
 class StateTimeline:
-    """Residency = where you live (taxes investment income).
-    Employment = where you work (taxes wages)."""
-    residency: list[StateAssignment] = field(default_factory=list)
-    employment: list[StateAssignment] = field(default_factory=list)
+    residency: list[ResidencyPeriod] = field(default_factory=list)
+    income_sources: list[IncomeSource] = field(default_factory=list)
 
-    def at_age(self, age: int, kind: Literal["residency", "employment"]
-               ) -> dict[str, float]:
-        """Return {state: weight} active at this age, normalised to sum 1.
-        Empty dict if nothing active (caller treats as no state tax)."""
-        items = self.residency if kind == "residency" else self.employment
-        active = [a for a in items if a.start_age <= age < a.end_age]
-        total_w = sum(a.weight for a in active)
-        if total_w <= 0:
-            return {}
+    # ----- year-window helpers -----
+
+    def year_window(self, sim_start: _dt.date, year_idx: int
+                    ) -> tuple[_dt.date, _dt.date]:
+        """[start, end) for simulation year `year_idx` (anchored to sim_start)."""
+        return (_add_years(sim_start, year_idx),
+                _add_years(sim_start, year_idx + 1))
+
+    def residency_weights(self, sim_start: _dt.date, year_idx: int
+                           ) -> dict[str, float]:
+        """state -> fraction of year resident in that state. Sum may be < 1
+        if the timeline has gaps (those periods incur no state tax)."""
+        ws, we = self.year_window(sim_start, year_idx)
         out: dict[str, float] = {}
-        for a in active:
-            out[a.state] = out.get(a.state, 0.0) + a.weight / total_w
+        year_len = max(1, (we - ws).days)
+        for r in self.residency:
+            ovl = _interval_overlap_days(ws, we, r.start, r.end)
+            if ovl > 0:
+                out[r.state] = out.get(r.state, 0.0) + ovl / year_len
         return out
 
+    def wages_by_state(self, sim_start: _dt.date, year_idx: int
+                        ) -> dict[str, float]:
+        """state -> nominal wages active in this state during this year.
+        Wages from a source are pro-rated by fraction-of-year overlap and
+        grown from the source's own start date at the source's growth rate.
+        """
+        ws, we = self.year_window(sim_start, year_idx)
+        out: dict[str, float] = {}
+        year_len = max(1, (we - ws).days)
+        for src in self.income_sources:
+            ovl_lo = max(ws, src.start)
+            ovl_hi = min(we, src.end)
+            ovl = (ovl_hi - ovl_lo).days
+            if ovl <= 0:
+                continue
+            # Grow from source.start to mid-overlap
+            mid_days = (ovl_lo - src.start).days + ovl // 2
+            growth_yrs = max(0.0, mid_days / DAYS_PER_YEAR)
+            grown = src.gross_annual * (1.0 + src.growth_rate) ** growth_yrs
+            wages = grown * (ovl / year_len)
+            out[src.state] = out.get(src.state, 0.0) + wages
+        return out
 
-def multi_state_tax(*, ordinary_income_wages: float, ordinary_income_other: float,
-                    ltcg_income: float, age: int, filing_status: FilingStatus,
-                    timeline: StateTimeline) -> float:
-    """Scalar multi-state tax for a single year.
+    def total_wages(self, sim_start: _dt.date, year_idx: int) -> float:
+        return sum(self.wages_by_state(sim_start, year_idx).values())
 
-    Wages (`ordinary_income_wages`) follow the *employment* timeline.
-    Other ordinary income (RMDs, traditional withdrawals, dividends-as-ordinary,
-    Roth conversions) and capital gains follow the *residency* timeline.
-    """
-    res = timeline.at_age(age, "residency")
-    emp = timeline.at_age(age, "employment")
-    total = 0.0
-    for state, w in emp.items():
-        # Apportion only wages to this state. Other income may be small at
-        # employment-only weight; standard simplification: treat wages-only
-        # taxable in employment state.
-        total += w * state_tax(state=state, ordinary_income=ordinary_income_wages,
-                               ltcg_income=0.0, filing_status=filing_status)
-    for state, w in res.items():
-        total += w * state_tax(state=state,
-                               ordinary_income=ordinary_income_other,
-                               ltcg_income=ltcg_income,
-                               filing_status=filing_status)
-    return total
+    def has_wages(self, sim_start: _dt.date, year_idx: int) -> bool:
+        return self.total_wages(sim_start, year_idx) > 0
 
 
-def multi_state_tax_vec(*, ordinary_income_wages: np.ndarray,
-                        ordinary_income_other: np.ndarray,
-                        ltcg_income: np.ndarray, age: int,
-                        filing_status: FilingStatus,
-                        timeline: StateTimeline) -> np.ndarray:
-    """Vectorised version of multi_state_tax. All income inputs are (P,)."""
-    res = timeline.at_age(age, "residency")
-    emp = timeline.at_age(age, "employment")
-    P = ordinary_income_wages.shape[0]
-    total = np.zeros(P)
-    zeros = np.zeros(P)
-    for state, w in emp.items():
-        total += w * state_tax_vec(state=state, ordinary_income=ordinary_income_wages,
-                                   ltcg_income=zeros, filing_status=filing_status)
-    for state, w in res.items():
-        total += w * state_tax_vec(state=state,
-                                   ordinary_income=ordinary_income_other,
-                                   ltcg_income=ltcg_income,
-                                   filing_status=filing_status)
-    return total
+# ---------- Apportioned tax helpers ----------
+
+def state_wages_tax(*, wages_by_state: dict[str, float],
+                    pretax_401k: float, filing_status: FilingStatus) -> float:
+    """Scalar tax owed on wages across all employment states.
+
+    Pretax 401k contributions are apportioned across employment states by
+    each state's share of total wages, reducing that state's taxable wage
+    base. (This is the same approach the IRS Form W-2 + state nonresident
+    forms use for split-state employees, simplified.)"""
+    total = sum(wages_by_state.values())
+    if total <= 0:
+        return 0.0
+    out = 0.0
+    for state, w in wages_by_state.items():
+        pretax_share = pretax_401k * (w / total)
+        taxable_w = max(0.0, w - pretax_share)
+        out += state_tax(state=state, ordinary_income=taxable_w,
+                         ltcg_income=0.0, filing_status=filing_status)
+    return out
+
+
+def state_residency_tax_vec(*, residency_weights: dict[str, float],
+                            ordinary_other: np.ndarray, ltcg: np.ndarray,
+                            filing_status: FilingStatus) -> np.ndarray:
+    """Vectorised tax on investment income (and any non-wage ordinary income
+    such as RMDs, traditional withdrawals, Roth conversions) apportioned by
+    residency."""
+    P = ordinary_other.shape[0]
+    out = np.zeros(P)
+    for state, w in residency_weights.items():
+        out += w * state_tax_vec(state=state, ordinary_income=ordinary_other,
+                                 ltcg_income=ltcg, filing_status=filing_status)
+    return out
