@@ -201,6 +201,31 @@ class SimulationParams:
 
 
 @dataclass
+class Inheritance:
+    """One-time lump-sum deposit to a specified account at the given date.
+
+    `amount_real` is in today's dollars and is converted to nominal using
+    realised cumulative inflation at the deposit date.
+
+    Account treatment:
+      * `taxable`     — deposited as a fresh tax lot with basis = market value
+                        (mirrors cash receipt or stepped-up-basis from estate).
+                        Allocated across stock/bond/cash per the current
+                        per-account allocation policy at that year.
+      * `traditional` — added to the Traditional balance. Note: inherited
+                        IRAs are subject to the SECURE Act 10-year drawdown
+                        rule, NOT modelled here; treat with caution.
+      * `roth`        — added to Roth balance and to roth_basis (treated as
+                        penalty-free principal).
+
+    Estate / inheritance tax is NOT modelled — `amount_real` is the net
+    received after any estate-side taxes."""
+    date: _dt.date
+    amount_real: float
+    account: Literal["taxable", "traditional", "roth"] = "taxable"
+
+
+@dataclass
 class Scenario:
     profile: Profile
     state_taxes: StateTimeline
@@ -212,6 +237,7 @@ class Scenario:
     social_security: SocialSecurity = field(default_factory=SocialSecurity)
     withdrawal: WithdrawalPolicy = field(default_factory=WithdrawalPolicy)
     simulation: SimulationParams = field(default_factory=SimulationParams)
+    inheritances: list[Inheritance] = field(default_factory=list)
 
 
 # ---------- YAML helpers ----------
@@ -379,10 +405,19 @@ def load_scenario(path: str | Path) -> Scenario:
     timeline = _parse_state_timeline(
         raw.get("state_taxes", {}), raw.get("income", {}), profile)
 
+    inheritances: list[Inheritance] = []
+    for inh in raw.get("inheritances", []):
+        inheritances.append(Inheritance(
+            date=_to_date(inh["date"]),
+            amount_real=float(inh["amount_real"]),
+            account=inh.get("account", "taxable"),
+        ))
+
     return Scenario(
         profile=profile, state_taxes=timeline,
         savings=savings, spending=spending,
         initial_portfolio=portfolio, target_allocations=targets,
         market=market,
         social_security=ss, withdrawal=wd, simulation=sim,
+        inheritances=inheritances,
     )

@@ -248,6 +248,42 @@ def test_flexible_spending_scales_proportionally():
     assert late_target >= 50_000
 
 
+def test_inheritance_increases_wealth_at_date():
+    """A $1M real inheritance at age 60 should bump real wealth by ~$1M
+    in the year it lands (with deterministic returns)."""
+    from retire.config import Inheritance
+    scn = _basic_scenario(spending=40_000, n_paths=1)
+    # Deterministic
+    scn.market.stocks.vol = 1e-9
+    scn.market.bonds.vol = 1e-9
+    scn.market.cash.vol = 1e-9
+    scn.market.inflation_vol = 0.0
+    # Birthdate 1986-01-01, sim_start 2026-01-01 -> age 60 = 2046-01-01
+    scn.inheritances = [Inheritance(date=dt.date(2046, 1, 1),
+                                     amount_real=1_000_000,
+                                     account="taxable")]
+    r = simulate(scn)
+    p = r.paths[0]
+    # The inheritance lands at the start of year-loop y=20 (window
+    # [2046-01-01, 2047-01-01)) and is reflected in real_wealth_by_year[21]
+    # (end of that year). Compare to [20] (start of that year, before deposit).
+    pre = p.real_wealth_by_year[20]
+    post = p.real_wealth_by_year[21]
+    bump = post - pre
+    # Expect ~$1M of new real wealth, plus ~year of returns on it, minus
+    # the year's $40k retirement spending. Loose bracket.
+    assert 700_000 < bump < 1_200_000, f"bump {bump} not in expected range"
+
+
+def test_no_inheritance_default():
+    """Empty inheritances list = simulator runs unchanged."""
+    scn = _basic_scenario(spending=40_000, n_paths=50)
+    assert scn.inheritances == []
+    r = simulate(scn)
+    # Just check it runs
+    assert len(r.paths) == 50
+
+
 def test_no_flexible_spending_unchanged():
     """When .flexible is None, spending equals smile-adjusted baseline."""
     scn = _basic_scenario(spending=100_000, n_paths=100)

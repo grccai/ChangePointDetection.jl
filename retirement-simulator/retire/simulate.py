@@ -153,6 +153,34 @@ def _alloc_to_array(a: Allocation) -> np.ndarray:
     return np.array([a.stock, a.bond, a.cash])
 
 
+def _deposit_inheritance(s: VState, scn: Scenario, inh, year_idx: int) -> None:
+    """Deposit a one-time inheritance into the configured account.
+
+    Real -> nominal via realised cumulative inflation. Allocation across
+    stock/bond/cash uses the scenario's *configured* per-account targets
+    (we don't have the policy's year-specific decision here cheaply, but
+    deposit allocation is a minor effect — the account-level rebalance step
+    later in the year squares it back to target if applicable).
+    """
+    nominal = inh.amount_real * s.cumulative_inflation  # (P,)
+    if inh.account == "taxable":
+        tgt = _alloc_to_array(scn.target_allocations.taxable)
+        # Fresh basis: cost_basis = market_value (no embedded gain).
+        for ai in range(N_ASSETS):
+            amt = nominal * tgt[ai]
+            s.tax_st_value[:, ai] += amt
+            s.tax_st_basis[:, ai] += amt
+    elif inh.account == "traditional":
+        tgt = _alloc_to_array(scn.target_allocations.traditional)
+        s.trad_balance += nominal[:, None] * tgt[None, :]
+    elif inh.account == "roth":
+        tgt = _alloc_to_array(scn.target_allocations.roth)
+        s.roth_balance += nominal[:, None] * tgt[None, :]
+        s.roth_basis += nominal
+    else:
+        raise ValueError(f"unknown inheritance account: {inh.account}")
+
+
 def _spending_smile_factor(year_into_retirement: int, smile: str) -> float:
     if smile == "flat":
         return 1.0
@@ -232,6 +260,13 @@ def simulate(scn: Scenario,
         ret_y = R[:, y, :]
         infl_y = inflation[:, y]
         s.cumulative_inflation *= (1.0 + infl_y)
+
+        # ---- inheritance deposits whose date falls in this year window ----
+        if scn.inheritances:
+            year_lo, year_hi = timeline.year_window(sim_start, y)
+            for inh in scn.inheritances:
+                if year_lo <= inh.date < year_hi:
+                    _deposit_inheritance(s, scn, inh, y)
 
         # ---- query policy with current state summary ----
         if y == 0:

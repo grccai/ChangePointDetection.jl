@@ -126,3 +126,9 @@ simulation:
   n_paths: 5000
   seed: 42
   return_model: gbm
+
+# One-time inheritance(s). Amount is in TODAY'S dollars; converted to
+# nominal at the date using realised cumulative inflation. Estate tax not
+# modelled — `amount_real` is the net received.
+inheritances:
+  - {date: 2059-05-05, amount_real: 1000000, account: taxable}   # age 70
