@@ -12,17 +12,37 @@
 profile:
   birthdate:        1989-05-05
   start_date:       2026-05-05
-  retirement_date:  2039-05-05    # age 50
+  retirement_date:  2044-05-05    # age 55 (was 50)
   end_of_plan_date: 2084-05-05    # age 95
   filing_status:    single
 
+# Income sources — pieced together so the underlying salary trajectory is
+# continuous at 3%/yr growth from $240k at sim start, with state of
+# employment changing across the WA stint and a step-down to $150k at 50.
+#
+#   Date            Trajectory value (3%/yr from $240k @ 2026-05-05)
+#   2026-08-20      $240k * 1.03^0.293 ≈ $242k    (start of WA stint)
+#   2028-12-31      $240k * 1.03^2.660 ≈ $260k    (end of WA stint)
+#
+# During the WA stint, total wages split 60% OR / 40% WA. After returning,
+# CA at trajectory ($260k @ 2028-12-31) until age 50, then step-down to $150k.
 income:
   sources:
-    - {state: CA, start: 2026-05-05, end: 2039-05-05, gross_annual: 240000, growth_rate: 0.03}
+    # 1) CA pre-move
+    - {state: CA, start: 2026-05-05, end: 2026-08-20, gross_annual: 240000, growth_rate: 0.03}
+    # 2) WA stint, 60/40 OR/WA. (Common pattern: live in WA, work in OR.)
+    - {state: OR, start: 2026-08-20, end: 2028-12-31, gross_annual: 145000, growth_rate: 0.03}
+    - {state: WA, start: 2026-08-20, end: 2028-12-31, gross_annual:  97000, growth_rate: 0.03}
+    # 3) Back to CA, picking up the trajectory
+    - {state: CA, start: 2028-12-31, end: 2039-05-05, gross_annual: 260000, growth_rate: 0.03}
+    # 4) Step-down at age 50 to $150k, riding it to retirement at 55
+    - {state: CA, start: 2039-05-05, end: 2044-05-05, gross_annual: 150000, growth_rate: 0.03}
 
 state_taxes:
   residency:
-    - {state: CA, start: 2026-05-05, end: 2084-05-05}
+    - {state: CA, start: 2026-05-05, end: 2026-08-20}
+    - {state: WA, start: 2026-08-20, end: 2028-12-31}    # temporary WA move
+    - {state: CA, start: 2028-12-31, end: 2084-05-05}    # back to CA, stay
 
 savings:
   rate: 0.40
