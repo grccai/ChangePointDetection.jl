@@ -206,14 +206,17 @@ class _FIREProbObjective:
         prob_hit = float((wealth_fire >= self.fire_target_real).mean())
         ruin = result.failure_rate()
 
-        slack = ruin - self.ruin_max  # > 0 means infeasible
+        # Aim for tighter internal constraint than the user asked for, so
+        # inner-MC noise (≈0.4pp stderr at 800 paths) doesn't let an
+        # optimum slip across the boundary at the 5000-path final eval.
+        internal_target = max(0.0, self.ruin_max - 0.003)
+        slack = ruin - internal_target
         if slack <= 0:
             penalty = 0.0
         else:
-            # Linear + quadratic ramp; coefficients chosen so a 1pp violation
-            # ( slack=0.01 ) costs ~0.10 of P(hit), enough to dominate small
-            # gains in P(hit) at the constraint boundary.
-            penalty = 10.0 * slack + 5_000.0 * slack ** 2
+            # Heavy barrier: a 1pp violation costs 1.0+ of objective space,
+            # an order of magnitude bigger than any plausible gain in P(hit).
+            penalty = 100.0 * slack + 100_000.0 * slack ** 2
         return -prob_hit + penalty
 
 
