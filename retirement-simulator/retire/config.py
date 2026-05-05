@@ -36,15 +36,32 @@ class Profile:
     end_of_plan_date: _dt.date
     filing_status: FilingStatus = "single"
 
+    def _age_on(self, d: _dt.date) -> float:
+        """Age (years.fraction-of-current-year) on date `d`. Returns clean
+        integer values on birthday anniversaries — important so that
+        boundary checks (catchup at 50, SS claim, RMDs) trigger on the
+        right simulation year regardless of leap-year accumulation."""
+        int_years = d.year - self.birthdate.year
+        if (d.month, d.day) < (self.birthdate.month, self.birthdate.day):
+            int_years -= 1
+        last_birthday = _add_years(self.birthdate, int_years)
+        fractional = (d - last_birthday).days / DAYS_PER_YEAR
+        return int_years + fractional
+
     @property
     def age(self) -> float:
         """Age in years at simulation start."""
-        return (self.start_date - self.birthdate).days / DAYS_PER_YEAR
+        return self._age_on(self.start_date)
+
+    @property
+    def retirement_age(self) -> float:
+        """Age at retirement_date. Returns clean integer when retirement_date
+        falls on a birthday anniversary."""
+        return self._age_on(self.retirement_date)
 
     def age_at_year(self, year_idx: int) -> float:
         """Fractional age at the start of simulation year `year_idx`."""
-        d = _add_years(self.start_date, year_idx)
-        return (d - self.birthdate).days / DAYS_PER_YEAR
+        return self._age_on(_add_years(self.start_date, year_idx))
 
     def years_to_retirement(self) -> int:
         return max(0, int(round(

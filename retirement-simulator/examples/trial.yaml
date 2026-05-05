@@ -50,7 +50,9 @@ savings:
     trad_ira: 0
     roth_ira: 7000              # backdoor implicit at this income
     mega_backdoor_roth: max     # post-tax 401k -> Roth, up to 415(c) limit
-    employer_match_rate: 0.05
+    # Employer match: 50% on first 6% of pay -> effective 3% of pay.
+    # You contribute >= 6% of pay (max trad 401k on $240k+), so match maxes.
+    employer_match_rate: 0.03
 
 spending:
   annual_real: 100000           # POST-TAX retirement spending in today's $

@@ -251,8 +251,7 @@ def simulate(scn: Scenario,
     fs = scn.profile.filing_status
     timeline: StateTimeline = scn.state_taxes
     sim_start = scn.profile.start_date
-    retirement_age = (scn.profile.retirement_date - scn.profile.birthdate
-                      ).days / 365.25
+    retirement_age = scn.profile.retirement_age
     fire_target_real = 25.0 * scn.spending.annual_real  # 4% rule benchmark
 
     for y in range(horizon):
@@ -463,8 +462,7 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
 
     # 2) Spending target (real, then nominal). Per-path because flexible
     # spending makes the target depend on each path's portfolio drawdown.
-    retirement_age = (scn.profile.retirement_date - scn.profile.birthdate
-                      ).days / 365.25
+    retirement_age = scn.profile.retirement_age
     years_into_retire = max(0, int(round(age - retirement_age)))
     factor = _spending_smile_factor(years_into_retire, scn.spending.smile)
     base_real = scn.spending.annual_real * factor
@@ -505,10 +503,10 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
 
     # 4) RMDs (forced traditional withdrawal)
     rmd_amt = np.zeros(P)
-    if age >= RMD_START_AGE:
-        # Use prior year-end balance approximation = current balance pre-withdrawal
+    age_int = int(age + 1e-6)  # robust to float wobble on birthday boundary
+    if age_int >= RMD_START_AGE:
         prior_trad = s.trad_balance.sum(-1)
-        divisor = RMD_DIVISORS.get(min(age, max(RMD_DIVISORS)), 6.0)
+        divisor = RMD_DIVISORS.get(min(age_int, max(RMD_DIVISORS)), 6.0)
         rmd_amt = prior_trad / divisor
     rmd_taken = withdraw_traditional(s, rmd_amt)
 

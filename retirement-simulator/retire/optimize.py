@@ -121,10 +121,8 @@ def _build_policy(x: np.ndarray, scn_base: Scenario,
     cfg.location_mode."""
     if cfg.policy_class == "glide":
         start_age = scn_base.profile.age
-        end_age = (scn_base.profile.end_of_plan_date
-                   - scn_base.profile.birthdate).days / 365.25
-        retirement_age = (scn_base.profile.retirement_date
-                          - scn_base.profile.birthdate).days / 365.25
+        end_age = scn_base.profile._age_on(scn_base.profile.end_of_plan_date)
+        retirement_age = scn_base.profile.retirement_age
         ss_age = float(scn_base.social_security.claim_age)
         return build_glide_policy(list(x), start_age=start_age,
                                   end_age=end_age,
