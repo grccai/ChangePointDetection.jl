@@ -11,8 +11,11 @@ import typer
 
 from .accounts import Asset
 from .config import load_scenario
+from .export import export_allocation_xlsx
 from .location import (heuristic_target_allocations, overall_allocation_of,
                        tax_efficient_dollars)
+from .policy import (build_glide_policy, build_three_knot_glide_policy,
+                     StaticPolicy)
 from .simulate import simulate
 from .optimize import optimize, OptimizerConfig
 from .state_taxes import state_tax, STATES
@@ -244,6 +247,73 @@ def location(
                     ("traditional", targets.traditional),
                     ("roth", targets.roth)]:
         print(f"  {name:<12} stock={a.stock:.4f}  bond={a.bond:.4f}  cash={a.cash:.4f}")
+
+
+@app.command()
+def export_allocation(
+    config: Path = typer.Argument(..., exists=True, readable=True),
+    out: Path = typer.Argument(..., help="Output .xlsx path."),
+    policy: str = typer.Option(
+        "scenario", help="'scenario' (use scn.target_allocations as a static "
+                          "policy) | 'glide:<x>' (12 comma-separated floats) "
+                          "| 'three_knot:<x>' (16 comma-separated floats)."),
+    paths: int = typer.Option(5000, help="Number of MC paths to simulate."),
+) -> None:
+    """Run the simulator under a chosen policy and export year-by-year
+    per-(account, asset) balances and contributions, with one sheet per
+    quantile (5/25/50/75/95)."""
+    scn = load_scenario(config)
+    scn.simulation.n_paths = paths
+
+    pol = None
+    summary = ""
+    if policy.startswith("glide:") or policy.startswith("three_knot:"):
+        kind, _, vec_str = policy.partition(":")
+        try:
+            x = [float(v) for v in vec_str.split(",")]
+        except Exception as e:
+            raise typer.BadParameter(f"could not parse policy vector: {e}")
+        start_age = scn.profile.age
+        end_age = scn.profile._age_on(scn.profile.end_of_plan_date)
+        retirement_age = scn.profile.retirement_age
+        ss_age = float(scn.social_security.claim_age)
+        if kind == "glide":
+            pol = build_glide_policy(x, start_age=start_age, end_age=end_age,
+                                     retirement_age=retirement_age, ss_age=ss_age)
+            summary = f"Policy: 2-knot glide (12 vars)"
+        else:
+            pol = build_three_knot_glide_policy(
+                x, start_age=start_age, retirement_age=retirement_age,
+                end_age=end_age, ss_age=ss_age)
+            summary = f"Policy: 3-knot glide (16 vars), middle knot at age {retirement_age:.0f}"
+    else:
+        # Default: static StaticPolicy from the scenario's target allocations.
+        c = scn.savings.contributions
+        try:
+            pool = float(c.trad_401k) + float(c.roth_401k)
+            split = float(c.trad_401k) / pool if pool > 0 else 1.0
+        except (TypeError, ValueError):
+            split = 1.0
+        pol = StaticPolicy(allocations=scn.target_allocations,
+                           conversion_bracket=scn.withdrawal.roth_conversion_target_bracket,
+                           trad_contribution_split=split)
+        summary = "Policy: static (scenario target_allocations)"
+
+    print(f"Running {paths} MC paths under policy: {summary} ...")
+    result = simulate(scn, policy=pol)
+    fail = result.failure_rate()
+    print(f"  P(ruin) = {100*fail:.2f}%   median terminal real "
+          f"${result.terminal_quantiles([0.5])[0.5]:,.0f}")
+
+    horizon = scn.profile.horizon()
+    ages = np.array([scn.profile.age_at_year(y) for y in range(horizon + 1)])
+    export_allocation_xlsx(out_path=out,
+                           balance_by_year=result.real_balance_by_year,
+                           contrib_by_year=result.real_contrib_by_year,
+                           ages_at_year=ages,
+                           policy_summary=f"{summary}   "
+                                          f"P(ruin)={100*fail:.2f}%")
+    print(f"Wrote {out}  ({horizon + 1} years × 5 quantile sheets)")
 
 
 @app.command()

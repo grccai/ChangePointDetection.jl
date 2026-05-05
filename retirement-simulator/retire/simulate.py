@@ -127,6 +127,10 @@ class PathResult:
 @dataclass
 class SimResult:
     paths: list[PathResult]
+    # Detailed per-(path, year, account, asset) tracking. Set by simulate().
+    # Useful for downstream Excel/CSV export at quantile granularity.
+    real_balance_by_year: np.ndarray | None = None    # (P, H+1, 3, 3)
+    real_contrib_by_year: np.ndarray | None = None    # (P, H, 3, 3)
 
     @property
     def n_paths(self) -> int:
@@ -151,6 +155,20 @@ class SimResult:
 
 def _alloc_to_array(a: Allocation) -> np.ndarray:
     return np.array([a.stock, a.bond, a.cash])
+
+
+def _record_balances(s: VState, year_idx: int) -> None:
+    """Write end-of-year per-(account, asset) real balances into
+    s.real_balance_by_year[:, year_idx, :, :]. Account axis order:
+    [taxable, traditional, roth]."""
+    cum_inf = s.cumulative_inflation[:, None]   # (P, 1)
+    # Taxable: aggregate LT + ST cohorts per asset.
+    taxable_real = (s.tax_lt_value + s.tax_st_value) / cum_inf  # (P, 3)
+    trad_real = s.trad_balance / cum_inf
+    roth_real = s.roth_balance / cum_inf
+    s.real_balance_by_year[:, year_idx, 0, :] = taxable_real
+    s.real_balance_by_year[:, year_idx, 1, :] = trad_real
+    s.real_balance_by_year[:, year_idx, 2, :] = roth_real
 
 
 def _deposit_inheritance(s: VState, scn: Scenario, inh, year_idx: int) -> None:
@@ -245,6 +263,9 @@ def simulate(scn: Scenario,
     starting_wages = scn.state_taxes.total_wages(scn.profile.start_date, 0)
     s = VState.from_portfolio(scn.initial_portfolio, P, horizon,
                               starting_nominal_income=starting_wages)
+    # Year-0 (initial) balance snapshot — same across paths because the
+    # initial portfolio is a single specimen.
+    _record_balances(s, year_idx=0)
 
     yf = np.array([market.yield_fraction[a] for a in ASSET_ORDER])
 
@@ -296,6 +317,7 @@ def simulate(scn: Scenario,
                                decision)
         s.age_st_to_lt()
         s.real_wealth[:, y + 1] = s.total_value() / s.cumulative_inflation
+        _record_balances(s, year_idx=y + 1)
         if age >= retirement_age:
             s.failed |= (s.total_value() <= 0)
 
@@ -310,7 +332,9 @@ def simulate(scn: Scenario,
             lifetime_real_tax=float(s.real_taxes[i].sum()),
             failed=bool(s.failed[i]),
         ))
-    return SimResult(paths=paths)
+    return SimResult(paths=paths,
+                     real_balance_by_year=s.real_balance_by_year.copy(),
+                     real_contrib_by_year=s.real_contrib_by_year.copy())
 
 
 # ---------- Per-year accumulation step ----------
@@ -388,6 +412,19 @@ def _step_accumulation(s: VState, scn: Scenario, age: float, year_idx: int,
     s.roth_balance += mbdr * tgt_roth[None, :]
     s.roth_basis += mbdr
 
+    # Record contribution flows (real $) into the per-(year, account, asset)
+    # tracking array. Trad-account inflow this year = trad_401k + trad_ira +
+    # employer_match (all allocated per tgt_trad). Roth-account inflow =
+    # roth_401k + roth_ira + mbdr. Taxable-account inflow is recorded after
+    # the residual savings deposit below.
+    inv_inf = 1.0 / s.cumulative_inflation   # nominal -> real, (P,)
+    real_trad_in = (pretax_trad + employer_match) * inv_inf   # (P,)
+    real_roth_in = (roth_direct + mbdr) * inv_inf
+    s.real_contrib_by_year[:, year_idx, 1, :] = (
+        real_trad_in[:, None] * tgt_trad[None, :])
+    s.real_contrib_by_year[:, year_idx, 2, :] = (
+        real_roth_in[:, None] * tgt_roth[None, :])
+
     # 4) Tax bill
     # Federal: ordinary base = wages_after_pretax + ord_div; LTCG = qual_div.
     wages_after_pretax = max(0.0, total_wages - pretax_trad)
@@ -420,6 +457,9 @@ def _step_accumulation(s: VState, scn: Scenario, age: float, year_idx: int,
         implied_living = (1.0 - scn.savings.rate) * total_wages
     taxable_savings = np.maximum(0.0, take_home - implied_living)
     deposit_taxable_st_split(s, taxable_savings, tgt_tax)
+    real_taxable_in = taxable_savings * inv_inf      # (P,)
+    s.real_contrib_by_year[:, year_idx, 0, :] = (
+        real_taxable_in[:, None] * tgt_tax[None, :])
 
     # 6) Rebalance tax-advantaged
     _rebalance_to_target(s.trad_balance, tgt_trad)

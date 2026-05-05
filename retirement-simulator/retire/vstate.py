@@ -70,6 +70,12 @@ class VState:
     real_taxes: np.ndarray          # (P, H)
     real_target_spend: np.ndarray   # (P, H)
     real_shortfall: np.ndarray      # (P, H)
+    # Detailed per-(year, account, asset) tracking. Account axis index:
+    # 0 = taxable, 1 = traditional, 2 = roth.  Asset axis index follows
+    # ASSET_ORDER (0=stock, 1=bond, 2=cash). Stored as REAL dollars (after
+    # dividing by cumulative_inflation at end of each year).
+    real_balance_by_year: np.ndarray   # (P, H + 1, 3, 3)
+    real_contrib_by_year: np.ndarray   # (P, H, 3, 3) — fresh deposits only
 
     # ------- constructors -------
 
@@ -94,6 +100,8 @@ class VState:
             real_taxes=np.zeros((n_paths, horizon)),
             real_target_spend=np.zeros((n_paths, horizon)),
             real_shortfall=np.zeros((n_paths, horizon)),
+            real_balance_by_year=np.zeros((n_paths, horizon + 1, 3, 3)),
+            real_contrib_by_year=np.zeros((n_paths, horizon, 3, 3)),
         )
         # Aggregate taxable lots into LT/ST cohorts
         for lot in portfolio.taxable.lots:
