@@ -84,9 +84,11 @@ def optimize_cmd(
     ),
     objective: str = typer.Option(
         "utility",
-        help="'utility' (CRRA + bequest + failure penalty) or 'fire_prob' "
+        help="'utility' (CRRA + bequest + failure penalty) | 'fire_prob' "
              "(maximize P(wealth at --fire-age >= --fire-target) subject to "
-             "P(ruin) <= --ruin-max).",
+             "P(ruin) <= --ruin-max) | 'fire_prob_weighted' (time-decayed "
+             "11-year sum of FIRE probabilities, max value 5.5; same ruin "
+             "constraint).",
     ),
     fire_age: int = typer.Option(50, help="FIRE target age (only for fire_prob)."),
     fire_target: float = typer.Option(2_500_000, help="Real-dollar FIRE target "
@@ -96,12 +98,13 @@ def optimize_cmd(
 ) -> None:
     """Optimize allocation and contribution split for the scenario."""
     scn = load_scenario(config)
+    fire_objs = {"fire_prob", "fire_prob_weighted"}
     cfg = OptimizerConfig(gamma=gamma, n_paths_inner=paths, maxiter=maxiter,
                          popsize=popsize, workers=workers,
                          location_mode=location_mode, policy_class=policy,
                          objective=objective,
-                         fire_age=fire_age if objective == "fire_prob" else None,
-                         fire_target_real=fire_target if objective == "fire_prob"
+                         fire_age=fire_age if objective in fire_objs else None,
+                         fire_target_real=fire_target if objective in fire_objs
                                           else None,
                          ruin_max=ruin_max)
     print("Running differential evolution... (this can take a few minutes)")
@@ -138,23 +141,40 @@ def optimize_cmd(
     result = simulate(scn, policy=diag["policy"])
     _print_summary(scn, result, "Final evaluation at optimum")
 
-    if objective == "fire_prob":
+    if objective in ("fire_prob", "fire_prob_weighted"):
         import numpy as np
-        # Recompute P(hit FIRE target) and feasibility at final_paths
         start_age = scn.profile.age
-        year_idx_at_fire = max(0, min(scn.profile.horizon(),
-                                       int(round(fire_age - start_age))))
-        wealth_fire = np.array([p.real_wealth_by_year[year_idx_at_fire]
-                                 for p in result.paths])
-        prob_hit = float((wealth_fire >= fire_target).mean())
+        horizon = scn.profile.horizon()
+        wealth_arr = np.array([p.real_wealth_by_year for p in result.paths])
         ruin = result.failure_rate()
         feas = "FEASIBLE" if ruin <= ruin_max else "INFEASIBLE"
-        print(f"\n=== FIRE-prob objective ===")
-        print(f"  P(real wealth at age {fire_age} >= ${fire_target:,.0f}): {100*prob_hit:.2f}%")
-        print(f"  Wealth at age {fire_age} quantiles (real $):")
-        for q in [0.05, 0.25, 0.5, 0.75, 0.95]:
-            print(f"    {int(q*100):>3}th pct  ${np.quantile(wealth_fire, q):>14,.0f}")
-        print(f"  P(ruin) over full plan: {100*ruin:.2f}%   "
+
+        if objective == "fire_prob":
+            year_idx_at_fire = max(0, min(horizon, int(round(fire_age - start_age))))
+            prob_hit = float((wealth_arr[:, year_idx_at_fire] >= fire_target).mean())
+            print(f"\n=== FIRE-prob objective ===")
+            print(f"  P(real wealth at age {fire_age} >= ${fire_target:,.0f}): {100*prob_hit:.2f}%")
+            print(f"  Wealth at age {fire_age} quantiles (real $):")
+            for q in [0.05, 0.25, 0.5, 0.75, 0.95]:
+                print(f"    {int(q*100):>3}th pct  ${np.quantile(wealth_arr[:, year_idx_at_fire], q):>14,.0f}")
+        else:
+            # fire_prob_weighted
+            year_indices = [min(horizon, max(0, int(round(fire_age + i - start_age))))
+                             for i in range(11)]
+            weights = np.array([1.0 - i / 10.0 for i in range(11)])
+            p_hit = np.array([
+                (wealth_arr[:, idx] >= fire_target).mean()
+                for idx in year_indices
+            ])
+            reward = float((weights * p_hit).sum())
+            print(f"\n=== Weighted FIRE-prob objective ===")
+            print(f"  Reward = sum_{{i=0..10}} (1 - i/10) * P(W_{{age {fire_age}+i}} >= ${fire_target:,.0f})")
+            print(f"         = {reward:.3f}   (max possible: 5.500)")
+            print(f"  Per-age FIRE probabilities (real wealth >= target):")
+            for i, idx, p, w in zip(range(11), year_indices, p_hit, weights):
+                print(f"    age {fire_age+i}  weight {w:.1f}   "
+                      f"P(W >= target) = {100*p:.2f}%   contrib {w*p:.3f}")
+        print(f"\n  P(ruin) over full plan: {100*ruin:.2f}%   "
               f"(constraint: <= {100*ruin_max:.2f}%)   --> {feas}")
 
 

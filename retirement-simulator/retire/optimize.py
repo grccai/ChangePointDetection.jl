@@ -70,6 +70,11 @@ class OptimizerConfig:
     #   'fire_prob' : maximize P(real wealth at `fire_age` >= `fire_target_real`)
     #                 subject to P(ruin over full horizon) <= `ruin_max`. The
     #                 ruin constraint is a steep penalty (effectively hard).
+    #   'fire_prob_weighted' : maximize a 11-year time-decayed sum of FIRE
+    #                 probabilities,
+    #                     sum_{i=0..10} (1 - i/10) * P(W_{fire_age+i} >= T),
+    #                 subject to the same ruin constraint. Rewards hitting
+    #                 the target *early*; max possible value = 5.5.
     objective: str = "utility"
     # fire_prob-specific knobs (None defaults are filled in by `optimize()`).
     fire_target_real: float | None = None    # default: 25 * scn.spending.annual_real
@@ -220,21 +225,79 @@ class _FIREProbObjective:
         return -prob_hit + penalty
 
 
+@dataclass
+class _FIREProbWeightedObjective:
+    """Time-decayed FIRE probability:
+
+        reward = sum_{i=0..10} (1 - i/10) * P(W_{fire_age+i} >= target)
+
+    subject to P(ruin) <= ruin_max via the same barrier-style penalty as
+    `_FIREProbObjective`. Max reward = 5.5 (= 1 + 0.9 + 0.8 + ... + 0.0)
+    if every retirement year is at-or-above target. The weights linearly
+    decay to zero at age fire_age+10, so hitting the target early is
+    materially better than late.
+    """
+    scn_base: Scenario
+    cfg: OptimizerConfig
+    fire_age: int
+    fire_target_real: float
+    ruin_max: float
+    year_indices: list[int]   # year_idx for ages fire_age..fire_age+10
+    weights: np.ndarray       # length 11, (1 - i/10) for i=0..10
+
+    def __call__(self, x: np.ndarray) -> float:
+        policy = _build_policy(x, self.scn_base, self.cfg)
+        scn = deepcopy(self.scn_base)
+        scn.simulation.n_paths = self.cfg.n_paths_inner
+        scn.simulation.seed = self.cfg.seed
+        result = simulate(scn, policy=policy)
+
+        wealth_arr = np.array([p.real_wealth_by_year for p in result.paths])
+        # P(W_{fire_age+i} >= T) for each i: shape (11,)
+        p_hit = np.array([
+            (wealth_arr[:, idx] >= self.fire_target_real).mean()
+            for idx in self.year_indices
+        ])
+        reward = float((self.weights * p_hit).sum())  # in [0, 5.5]
+
+        ruin = result.failure_rate()
+        internal_target = max(0.0, self.ruin_max - 0.003)
+        slack = ruin - internal_target
+        if slack <= 0:
+            penalty = 0.0
+        else:
+            penalty = 100.0 * slack + 100_000.0 * slack ** 2
+        return -reward + penalty
+
+
 def _objective_for(scn_base: Scenario, cfg: OptimizerConfig):
-    if cfg.objective == "fire_prob":
+    if cfg.objective in ("fire_prob", "fire_prob_weighted"):
         fire_age = cfg.fire_age if cfg.fire_age is not None \
             else int(round(scn_base.profile.retirement_age))
         fire_target = cfg.fire_target_real if cfg.fire_target_real is not None \
             else 25.0 * scn_base.spending.annual_real
-        # year_idx where age first reaches fire_age. Profile.age is age-at-start;
-        # year_idx_at_fire = round(fire_age - profile.age).
-        year_idx_at_fire = max(0, min(scn_base.profile.horizon(),
-                                       int(round(fire_age - scn_base.profile.age))))
-        return _FIREProbObjective(
+        horizon = scn_base.profile.horizon()
+        start_age = scn_base.profile.age
+        year_idx_at_fire = max(0, min(horizon,
+                                       int(round(fire_age - start_age))))
+        if cfg.objective == "fire_prob":
+            return _FIREProbObjective(
+                scn_base=scn_base, cfg=cfg,
+                fire_age=fire_age, fire_target_real=fire_target,
+                ruin_max=cfg.ruin_max,
+                year_idx_at_fire=year_idx_at_fire,
+            )
+        # fire_prob_weighted
+        year_indices = [
+            min(horizon, max(0, int(round(fire_age + i - start_age))))
+            for i in range(11)
+        ]
+        weights = np.array([1.0 - i / 10.0 for i in range(11)])
+        return _FIREProbWeightedObjective(
             scn_base=scn_base, cfg=cfg,
             fire_age=fire_age, fire_target_real=fire_target,
             ruin_max=cfg.ruin_max,
-            year_idx_at_fire=year_idx_at_fire,
+            year_indices=year_indices, weights=weights,
         )
     return _Objective(
         scn_base=scn_base, cfg=cfg,
