@@ -17,7 +17,9 @@ because branch hosting requires it.
 
 Given:
 * your age, income, savings rate, target retirement (FIRE) age and end-of-plan
-  age, filing status, state tax rate;
+  age, filing status;
+* a **state-of-residence and state-of-employment timeline**, with optional
+  overlap (e.g. half-time job in two states);
 * current account balances split across taxable / Traditional / Roth, and
   inside taxable account the per-lot **cost basis** and **holding period**
   (long-term vs short-term);
@@ -30,18 +32,31 @@ including:
 * long-term capital gains stacking on top of ordinary income;
 * Net Investment Income Tax (3.8% on the lesser of NII or MAGI excess);
 * Social Security taxation via the IRS provisional-income method;
-* state tax as a flat marginal rate;
+* **state tax for CA, OR, and WA** with separate residency-vs-employment
+  apportionment (gains follow residency; wages follow employment);
 * required minimum distributions (Uniform Lifetime Table, age 73 onward);
+* **mega-backdoor Roth** (after-tax 401k -> Roth, up to 415(c) total);
 * Roth conversion ladders that fill a target ordinary-income bracket;
+* the **5-year Roth conversion clock** — fresh conversion principal is
+  penalty-prone if withdrawn before age 59½ within 5 years of conversion;
 * an ACA MAGI cap that constrains conversions before age 65;
-* lot-level taxable-account sales preferring long-term, lowest-gain lots;
+* lot-level taxable-account sales preferring long-term cohorts;
 * dividend / coupon yield treated as taxable annually inside the taxable
   account, while price appreciation is deferred until sale.
+
+The simulation is **vectorised over Monte Carlo paths** with numpy: 5000
+paths × 60 years runs in a couple of seconds (>3000 paths/sec on a single
+core; ~180× faster than the original scalar engine).
 
 It then **optimizes** allocations across the three accounts plus the
 Traditional/Roth contribution split and Roth conversion target bracket using
 differential evolution against an expected-utility objective with a CRRA
-preference and a plan-failure penalty.
+preference and a plan-failure penalty. Two location modes:
+* `free` (8 vars): jointly optimize allocation and location.
+* `heuristic` (4 vars): optimize overall (stock, bond, cash) and let the
+  Reichenstein-style location heuristic place each asset (bonds in
+  Traditional, stocks in Roth, cash in Taxable). Faster convergence,
+  smaller decision space.
 
 ## Install
 
@@ -66,8 +81,16 @@ retire simulate-cmd examples/example.yaml --paths-csv out.csv
 # Optimize allocation + contribution split + conversion bracket
 retire optimize-cmd examples/example.yaml --paths 1500 --maxiter 30
 
-# Compute a one-off tax bill
-retire tax 200000 --ltcg 20000 --filing single --state-rate 0.05
+# Optimize using the tax-efficient asset-location heuristic (4 vars instead
+# of 8, faster convergence)
+retire optimize-cmd examples/example.yaml --location-mode heuristic
+
+# Compute the tax-efficient asset-location placement for a given overall
+# allocation against the scenario's current account totals
+retire location examples/example.yaml --stock 0.7 --bond 0.25
+
+# Compute a one-off tax bill (federal + a specific state)
+retire tax 200000 --ltcg 20000 --filing single --state CA
 ```
 
 ## Mathematical model
@@ -94,6 +117,36 @@ gains in the slice [I<sub>ord</sub>, I<sub>ord</sub> + G<sub>LT</sub>] are
 taxed at the LTCG bracket rate prevailing in that slice, integrated
 piecewise. Social Security taxability follows the two-tier provisional income
 rule. NIIT is 0.038 × min(NII, MAGI − threshold).
+
+State tax is in `state_taxes.py` with 2024 brackets for **CA**, **OR**, and
+**WA**:
+
+* **CA**: progressive 1%–12.3% with the 1% Mental Health Services surcharge
+  folded into the 13.3% top bracket. LTCG taxed *as ordinary income* (no
+  preferential CA rate).
+* **OR**: progressive 4.75%–9.9%. LTCG taxed as ordinary income.
+* **WA**: no income tax on wages or ordinary investment income; flat 7%
+  Capital Gains Tax on long-term gains exceeding $262,000.
+
+Multi-state apportionment is exposed via a `StateTimeline` of
+`StateAssignment(state, start_age, end_age, weight=1.0)` for *residency*
+and *employment*. Wages are taxed by employment-state(s); investment income
+(dividends, capital gains, RMDs, conversions) is taxed by residency-state(s).
+Concurrent assignments with weights model split-state work years.
+
+### Asset location
+
+Tax-efficient asset *location* (which account holds which asset) is a
+distinct lever from asset *allocation* (overall mix). The heuristic in
+`location.py` greedily places:
+
+* bonds → Traditional first, Taxable second, Roth last;
+* cash → Taxable first, Traditional second, Roth last;
+* stocks → Roth first, Taxable second, Traditional last.
+
+With this fixed location rule, the optimizer's decision space drops from 8
+variables to 4 (overall stock/bond + conversion bracket + Trad/Roth split),
+and convergence improves materially.
 
 ### Lot accounting
 
@@ -158,31 +211,43 @@ allocation is re-evaluated at 5000 paths.
 |----------------------------------------------------|----------------------------------------|
 | Federal ordinary tax brackets (2024)               | AMT                                    |
 | LTCG stacking on top of ordinary                   | QBI deduction                          |
-| NIIT (3.8%)                                        | State *brackets* (only flat rate)      |
-| Standard deduction                                 | IRMAA Medicare surcharges              |
-| Social Security provisional-income taxation        | Detailed ACA premium tax credit calc   |
-| RMDs (Uniform Lifetime Table)                      | HSA, mega-backdoor Roth                |
-| Roth conversion ladder, ACA MAGI cap (cliff)       | Stochastic mortality / longevity risk  |
-| Long-term vs short-term capital gains              | Asset location optimization (separate from allocation) |
-| Lot-level basis with HIFO/lowest-gain selection    | Margin loans, leverage                 |
-| Dividend / coupon yield vs price appreciation      | Tax-loss harvesting credit carryforwards |
-| Employer 401k match                                | Custom withdrawal smiles beyond Bengen |
-| Bengen smile retirement spending profile           | Inheritance / large bequests           |
-| CRRA + bequest objective                           | Variable spending strategies (Guyton-Klinger) |
+| NIIT (3.8%)                                        | IRMAA Medicare surcharges              |
+| Standard deduction                                 | Detailed ACA premium tax credit calc   |
+| Social Security provisional-income taxation        | HSA, FSA                               |
+| **CA / OR / WA state brackets** (2024)             | Other states' brackets                 |
+| **Multi-state residency / employment timelines**   | Part-year / non-resident apportionment   |
+| RMDs (Uniform Lifetime Table)                      | Stochastic mortality / longevity risk  |
+| Roth conversion ladder, ACA MAGI cap (cliff)       | Margin loans, leverage                 |
+| **5-year Roth conversion clock** with penalty      | Tax-loss harvesting credit carryforwards |
+| Long-term vs short-term capital gains              | Custom withdrawal smiles beyond Bengen |
+| Cohort-aggregated basis with LT preference         | Inheritance / large bequests           |
+| Dividend / coupon yield vs price appreciation      | Variable spending strategies (Guyton-Klinger) |
+| Employer 401k match                                | Backdoor Roth income phase-outs        |
+| **Mega-backdoor Roth (after-tax 401k)**            | Roth IRA / deductible IRA income limits |
+| Bengen smile retirement spending profile           | Self-employed plans (SEP, Solo 401k)   |
+| **Asset-location heuristic** (Reichenstein)        | Lump-sum bequests / inheritance        |
+| CRRA + bequest objective                           |                                        |
+| **Vectorised numpy simulation engine**             |                                        |
 
 ## Performance
 
-The simulation runs about 15–25 paths/second on a single core for a 60-year
-horizon. Most of the cost is `deepcopy` of the lot list at the start of each
-path. This is fine for `simulate-cmd` (5000 paths × 60 years finishes in a
-few minutes) but makes `optimize-cmd` slow: differential evolution needs
-hundreds of objective evaluations, each its own MC. Practical knobs:
+The simulation engine is **vectorised** across Monte Carlo paths. State per
+path lives in numpy arrays (taxable LT/ST cohorts as `(P, 3)`, Trad and Roth
+balances as `(P, 3)`, conversion ledger as `(P, H+1)`); the only Python loop
+is the year loop, where each year's operations are batched across paths.
 
-* `--paths 500 --maxiter 15 --popsize 6` — low-fidelity scan, ~10 minutes.
-* `--workers $(nproc)` — DE parallelizes objective evaluations across cores.
-* For serious work, profile and replace the lot-tracking inner loop with a
-  vectorised representation (single ndarray of (n_lots, 3) with bulk
-  operations); ~50× speedup is achievable.
+On a single core: ~3000 paths/second for a 60-year horizon, so 5000 paths
+finishes in under 2 seconds. Scales linearly until `(P, H+1)` arrays no
+longer fit in cache (millions of paths). `optimize-cmd` issues a fresh MC
+per evaluation; with `--paths 1500 --maxiter 30 --popsize 12` (default) the
+optimizer converges in 1–3 minutes.
+
+`--workers $(nproc)` enables scipy's parallel DE evaluations across cores.
+
+The cohort aggregation in the taxable account loses the within-cohort
+"specific ID, lowest-gain lot" refinement of the prior scalar engine. In
+exchange we get a >100× speedup with negligible difference in realised LT
+vs ST tax, which is the load-bearing distinction.
 
 ## Limitations and known approximations
 
@@ -243,12 +308,18 @@ retirement-simulator/
 │   ├── accounts.py           # Lot, TaxableAccount, TaxAdvantagedAccount, Portfolio
 │   ├── cli.py                # Typer CLI entrypoint
 │   ├── config.py             # YAML parsing, dataclass schema
+│   ├── location.py           # tax-efficient asset-location heuristic
 │   ├── optimize.py           # differential evolution allocation optimizer
 │   ├── returns.py            # GBM + bootstrap return models
-│   ├── simulate.py           # year-by-year accumulation + decumulation engine
-│   └── taxes.py              # 2024 federal tax math + RMD divisors
+│   ├── simulate.py           # vectorised year-by-year simulation engine
+│   ├── state_taxes.py        # CA / OR / WA brackets, multi-state timeline
+│   ├── taxes.py              # 2024 federal tax math + RMD divisors
+│   └── vstate.py             # batched numpy state for the vectorised engine
 └── tests/
     ├── test_accounts.py
+    ├── test_location.py
     ├── test_returns.py
+    ├── test_simulate.py      # integration tests on the vector engine
+    ├── test_state_taxes.py
     └── test_taxes.py
 ```

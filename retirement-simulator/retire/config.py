@@ -16,6 +16,7 @@ import yaml
 from .accounts import (Asset, AccountType, Lot, Portfolio,
                        TaxableAccount, TaxAdvantagedAccount)
 from .returns import AssetParams, MarketModel
+from .state_taxes import StateTimeline, StateAssignment
 from .taxes import FilingStatus
 
 
@@ -25,7 +26,6 @@ class Profile:
     retirement_age: int
     end_of_plan_age: int
     filing_status: FilingStatus = "single"
-    state_marginal_rate: float = 0.0  # state income tax flat rate
 
     def years_to_retirement(self) -> int:
         return max(0, self.retirement_age - self.age)
@@ -44,11 +44,17 @@ class Income:
 class Contributions:
     """Annual contribution policy. Values can be either a fixed dollar amount
     or the string 'max' (-> use IRS limit). Excess savings beyond these go
-    to taxable."""
+    to taxable.
+
+    `mega_backdoor_roth` is the after-tax 401k contribution that gets
+    immediately converted to Roth (in-plan or via in-service distribution).
+    Limit = $69,000 (2024 415(c) total) - employee_pretax - employer_match.
+    """
     trad_401k: float | str = 0.0
     roth_401k: float | str = 0.0
     trad_ira: float | str = 0.0
     roth_ira: float | str = 0.0
+    mega_backdoor_roth: float | str = 0.0
     employer_match_rate: float = 0.0  # employer matches X * gross, deposited to traditional 401k
 
 
@@ -153,6 +159,7 @@ class Scenario:
     initial_portfolio: Portfolio
     target_allocations: TargetAllocations
     market: MarketConfig
+    state_taxes: StateTimeline = field(default_factory=StateTimeline)
     social_security: SocialSecurity = field(default_factory=SocialSecurity)
     withdrawal: WithdrawalPolicy = field(default_factory=WithdrawalPolicy)
     simulation: SimulationParams = field(default_factory=SimulationParams)
@@ -224,8 +231,39 @@ def load_scenario(path: str | Path) -> Scenario:
     wd = WithdrawalPolicy(**raw.get("withdrawal", {}))
     sim = SimulationParams(**raw.get("simulation", {}))
 
+    # State tax timeline. Two forms accepted:
+    #   state_taxes:
+    #     residency: [{state: CA, start_age: 35, end_age: 50}, ...]
+    #     employment: [...]
+    # Or shorthand:
+    #   state_taxes:
+    #     state: CA   -> applied as both residency and employment for whole life
+    st_raw = raw.get("state_taxes", {})
+    timeline = StateTimeline()
+    if "state" in st_raw:
+        s = st_raw["state"]
+        timeline.residency.append(
+            StateAssignment(state=s, start_age=profile.age,
+                            end_age=profile.end_of_plan_age + 1))
+        timeline.employment.append(
+            StateAssignment(state=s, start_age=profile.age,
+                            end_age=profile.retirement_age))
+    if "residency" in st_raw:
+        for entry in st_raw["residency"]:
+            timeline.residency.append(StateAssignment(
+                state=entry["state"], start_age=int(entry["start_age"]),
+                end_age=int(entry["end_age"]),
+                weight=float(entry.get("weight", 1.0))))
+    if "employment" in st_raw:
+        for entry in st_raw["employment"]:
+            timeline.employment.append(StateAssignment(
+                state=entry["state"], start_age=int(entry["start_age"]),
+                end_age=int(entry["end_age"]),
+                weight=float(entry.get("weight", 1.0))))
+
     return Scenario(
         profile=profile, income=income, savings=savings, spending=spending,
         initial_portfolio=portfolio, target_allocations=targets,
-        market=market, social_security=ss, withdrawal=wd, simulation=sim,
+        market=market, state_taxes=timeline,
+        social_security=ss, withdrawal=wd, simulation=sim,
     )

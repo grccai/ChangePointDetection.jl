@@ -1,61 +1,125 @@
-"""Year-by-year simulation engine.
+"""Vectorised year-by-year retirement simulation.
 
-State variables that evolve:
-  * portfolio (taxable lots, traditional balances by asset, Roth balances)
-  * age
-  * cumulative_inflation_factor (real -> nominal conversion)
-  * income_path (nominal)
+All Monte Carlo paths advance in lock-step inside numpy ops. Per-path Python
+loops are gone except for the H year-step loop (which is unavoidable because
+each year's state depends on the prior year's). For H = 60 and P = 5000
+this runs in well under a second on a single core.
 
-Each simulated year, in order:
-  1. Update inflation factor.
-  2. If age < retirement_age:
-       a. Compute gross income, taxes during accumulation
-       b. Apply contributions: trad 401k (pre-tax), Roth 401k (post-tax),
-          trad IRA, Roth IRA, employer match (-> trad 401k)
-       c. Compute taxable savings residual; deposit to taxable account
-       d. Apply asset returns (with dividend yield treatment in taxable)
-       e. Rebalance toward target allocation per account
-     Else (decumulation):
-       a. Apply asset returns
-       b. Compute desired spending in nominal
-       c. Take RMDs if applicable
-       d. Optional Roth conversion to fill bracket / under ACA cap
-       e. Withdraw to cover spending net of SS using configured strategy
-       f. Compute taxes due; gross-up withdrawal
-       g. Rebalance
-  3. Age the lots by 1 year.
-
-We return per-path arrays of: terminal real wealth, year-end real wealth,
-spending shortfall flags, total lifetime taxes, and other diagnostics.
+The order of operations in each year is documented in the README.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from copy import deepcopy
-from typing import Callable
+from dataclasses import dataclass
+from typing import Tuple
 
 import numpy as np
 
-from .accounts import (Asset, AccountType, Lot, Portfolio,
-                       TaxableAccount, TaxAdvantagedAccount)
+from .accounts import Asset
 from .config import (Scenario, Allocation, TargetAllocations,
                      WithdrawalPolicy, Spending)
-from .returns import MarketModel, sample_gbm_paths, sample_inflation
-from .taxes import (TAX_2024, FilingStatus, compute_tax, TaxBill,
-                    required_min_distribution, top_of_bracket,
-                    progressive_tax)
+from .returns import sample_gbm_paths, sample_inflation
+from .state_taxes import (StateTimeline, multi_state_tax_vec, state_tax_vec)
+from .taxes import (TAX_2024, TaxYear, FilingStatus, Bracket,
+                    progressive_tax, ltcg_tax, taxable_social_security,
+                    niit_owed, required_min_distribution, top_of_bracket,
+                    RMD_DIVISORS, RMD_START_AGE)
+from .vstate import (VState, ASSET_IDX, ASSET_ORDER, N_ASSETS,
+                     deposit_taxable_st, deposit_taxable_st_split,
+                     withdraw_taxable_for_spending,
+                     withdraw_taxable_specific_asset,
+                     withdraw_traditional, withdraw_roth)
 
+
+# ---------- Vectorised tax-bill helpers ----------
+
+def _progressive_tax_vec(taxable: np.ndarray, brackets: list[Bracket]
+                         ) -> np.ndarray:
+    """Vectorised progressive tax. taxable: (P,) -> (P,)."""
+    if not brackets:
+        return np.zeros_like(taxable)
+    thresh = np.array([b.threshold for b in brackets] + [np.inf])
+    rates = np.array([b.rate for b in brackets])
+    t = np.maximum(0.0, taxable)
+    upper = thresh[1:][None, :]
+    lower = thresh[:-1][None, :]
+    in_b = np.clip(np.minimum(t[:, None], upper) - lower, 0.0, None)
+    return (in_b * rates[None, :]).sum(-1)
+
+
+def _ltcg_tax_vec(ord_taxable: np.ndarray, ltcg: np.ndarray,
+                  brackets: list[Bracket]) -> np.ndarray:
+    """Stack LTCG on top of ordinary taxable; tax at LTCG rates per slice."""
+    if not brackets:
+        return np.zeros_like(ord_taxable)
+    thresh = np.array([b.threshold for b in brackets] + [np.inf])
+    rates = np.array([b.rate for b in brackets])
+    P = ord_taxable.shape[0]
+    out = np.zeros(P)
+    pos = np.maximum(0.0, ord_taxable)
+    remaining = np.maximum(0.0, ltcg)
+    for i in range(len(rates)):
+        lo = thresh[i]
+        hi = thresh[i + 1]
+        # slice in this bracket: from max(pos, lo) to hi
+        slice_lo = np.maximum(pos, lo)
+        slice_hi = np.full(P, hi)
+        in_slice = np.clip(np.minimum(remaining, slice_hi - slice_lo), 0.0, None)
+        out += in_slice * rates[i]
+        remaining -= in_slice
+        pos += in_slice
+    return out
+
+
+def _ss_taxable_vec(ss_benefit: np.ndarray, other_income: np.ndarray,
+                    fs: FilingStatus, ty: TaxYear) -> np.ndarray:
+    lo, hi = ty.ss_provisional_thresholds[fs]
+    prov = other_income + 0.5 * ss_benefit
+    out = np.zeros_like(ss_benefit)
+    # Tier 1: between lo and hi
+    mask1 = (prov > lo) & (prov <= hi)
+    out = np.where(mask1, np.minimum(0.5 * (prov - lo),
+                                     0.5 * ss_benefit), out)
+    # Tier 2: above hi
+    mask2 = prov > hi
+    tier1 = np.minimum(0.5 * (hi - lo), 0.5 * ss_benefit)
+    tier2 = 0.85 * (prov - hi)
+    out = np.where(mask2, np.minimum(tier1 + tier2, 0.85 * ss_benefit), out)
+    return out
+
+
+def _niit_vec(magi: np.ndarray, nii: np.ndarray, fs: FilingStatus,
+              ty: TaxYear) -> np.ndarray:
+    th = ty.niit_threshold[fs]
+    excess = np.maximum(0.0, magi - th)
+    return ty.niit_rate * np.minimum(nii, excess)
+
+
+def _federal_tax_vec(ord_income: np.ndarray, ltcg_income: np.ndarray,
+                     ss_benefit: np.ndarray, fs: FilingStatus,
+                     ty: TaxYear = TAX_2024
+                     ) -> Tuple[np.ndarray, np.ndarray]:
+    """Returns (federal_total, ord_taxable_after_std_ded)."""
+    ss_tax = _ss_taxable_vec(ss_benefit, ord_income + ltcg_income, fs, ty)
+    sd = ty.std_deduction[fs]
+    ord_taxable = np.maximum(0.0, ord_income + ss_tax - sd)
+    fed_ord = _progressive_tax_vec(ord_taxable, ty.ordinary_brackets[fs])
+    fed_ltcg = _ltcg_tax_vec(ord_taxable, ltcg_income, ty.ltcg_brackets[fs])
+    magi = ord_income + ss_tax + ltcg_income
+    niit = _niit_vec(magi, ltcg_income, fs, ty)
+    return fed_ord + fed_ltcg + niit, ord_taxable
+
+
+# ---------- Result types (unchanged interface from the scalar version) ----------
 
 @dataclass
 class PathResult:
-    """Per-path summary."""
     terminal_real_wealth: float
-    real_wealth_by_year: np.ndarray   # length = horizon+1
-    real_spending_by_year: np.ndarray # length = horizon (target real spend)
-    real_shortfall_by_year: np.ndarray  # length = horizon (positive = unmet)
+    real_wealth_by_year: np.ndarray
+    real_spending_by_year: np.ndarray
+    real_shortfall_by_year: np.ndarray
     lifetime_real_tax: float
-    failed: bool   # ran out before end of plan
+    failed: bool
 
 
 @dataclass
@@ -75,7 +139,6 @@ class SimResult:
         return sum(1 for p in self.paths if p.failed) / max(1, self.n_paths)
 
     def cvar_failure(self, alpha: float = 0.05) -> float:
-        """Average of the worst alpha-fraction terminal wealths (real $)."""
         x = np.array([p.terminal_real_wealth for p in self.paths])
         x.sort()
         k = max(1, int(np.ceil(alpha * len(x))))
@@ -84,527 +147,386 @@ class SimResult:
 
 # ---------- helpers ----------
 
-def _resolve_contrib(value: float | str, limit: float) -> float:
+def _alloc_to_array(a: Allocation) -> np.ndarray:
+    return np.array([a.stock, a.bond, a.cash])
+
+
+def _spending_smile_factor(year_into_retirement: int, smile: str) -> float:
+    if smile == "flat":
+        return 1.0
+    if smile == "bengen":
+        if year_into_retirement < 10:
+            return 1.0 - 0.01 * year_into_retirement
+        if year_into_retirement < 20:
+            return 0.90
+        return min(1.10, 0.90 + 0.01 * (year_into_retirement - 20))
+    raise ValueError(f"unknown spending smile: {smile}")
+
+
+def _resolve_contrib_value(value: float | str, limit: float) -> float:
     if isinstance(value, str) and value == "max":
         return limit
     return float(value)
 
 
-def _spending_factor(years_into_retirement: int, smile: str) -> float:
-    """Multiplier on baseline real spending."""
-    if smile == "flat":
-        return 1.0
-    if smile == "bengen":
-        # Bengen smile approximation: -1%/yr first 10y, flat 10y, +1%/yr after
-        if years_into_retirement < 10:
-            return 1.0 - 0.01 * years_into_retirement
-        if years_into_retirement < 20:
-            return 0.90
-        return min(1.10, 0.90 + 0.01 * (years_into_retirement - 20))
-    raise ValueError(f"unknown spending smile: {smile}")
-
-
-def _rebalance_account_via_buys(account: TaxAdvantagedAccount,
-                                target: Allocation) -> None:
-    """In tax-advantaged accounts we can rebalance freely (no tax). Just set
-    each balance to target * total."""
-    total = account.value()
-    if total <= 0:
-        return
-    t = target.as_dict()
-    for a in Asset:
-        account.balances[a] = total * t[a]
-
-
-def _rebalance_taxable(taxable: TaxableAccount, target: Allocation,
-                       allow_sells: bool = False
-                       ) -> tuple[float, float]:
-    """Best-effort rebalance. By default only deposits redirect (tax-free).
-    With allow_sells=True, will also sell overweight to fix drift; returns
-    (lt_realized, st_realized).
-
-    For now we just track the drift and only sell if drift > 5pp on any asset
-    when allow_sells=True. Otherwise no action — caller is responsible for
-    directing deposits."""
-    if not allow_sells:
-        return 0.0, 0.0
-    total = taxable.value()
-    if total <= 0:
-        return 0.0, 0.0
-    t = target.as_dict()
-    lt = st = 0.0
-    for a in Asset:
-        cur = taxable.value(a)
-        want = total * t[a]
-        if cur - want > 0.05 * total:  # >5pp overweight
-            excess = cur - want
-            _, _lt, _st = taxable.sell_for(excess, a)
-            lt += _lt
-            st += _st
-    return lt, st
-
-
-def _direct_taxable_deposit(taxable: TaxableAccount, amount: float,
-                            target: Allocation) -> None:
-    """Spread a deposit across assets to push toward target allocation."""
-    if amount <= 0:
-        return
-    total_after = taxable.value() + amount
-    t = target.as_dict()
-    # For each asset, want_after = total_after * t[asset].
-    # Deposit need = max(0, want_after - current). May not sum to amount;
-    # normalize.
-    needs = {a: max(0.0, total_after * t[a] - taxable.value(a)) for a in Asset}
-    s = sum(needs.values())
-    if s <= 0:
-        # All overweight already; just deposit per target weights
-        for a in Asset:
-            taxable.deposit(a, amount * t[a])
-        return
-    for a in Asset:
-        taxable.deposit(a, amount * needs[a] / s)
-
-
-def _apply_asset_returns(portfolio: Portfolio,
-                         returns: dict[Asset, float],
-                         model: MarketModel
-                         ) -> tuple[float, float]:
-    """Apply one-period returns. Returns (taxable_qualified_div_income,
-    taxable_ordinary_div_income) for the year — these flow to the tax bill."""
-    qual = 0.0
-    ord_ = 0.0
-    for a in Asset:
-        r = returns[a]
-        # Tax-advantaged: just compound
-        portfolio.traditional.balances[a] *= (1.0 + r)
-        portfolio.roth.balances[a] *= (1.0 + r)
-        # Taxable: split into yield (dividend) + appreciation (deferred)
-        yf = model.yield_fraction[a] if r > 0 else 0.0
-        # Cap yield_fraction effect when total_return is negative (no
-        # negative dividends): apply price-only return
-        if r < 0:
-            for lot in portfolio.taxable.lots:
-                if lot.asset == a:
-                    lot.market_value *= (1.0 + r)
-        else:
-            q, o = portfolio.taxable.apply_returns(a, r, yf)
-            qual += q
-            ord_ += o
-    return qual, ord_
-
-
-# ---------- accumulation ----------
-
-@dataclass
-class _AccumState:
-    nominal_income: float
-    cumulative_inflation: float
-
-
-def _step_accumulation(scn: Scenario, p: Portfolio, age: int, year_idx: int,
-                       returns_year: dict[Asset, float], inflation: float,
-                       state: _AccumState) -> tuple[float, float]:
-    """Run one accumulation year. Returns (real_wealth_end, real_taxes)."""
-    targets = scn.target_allocations
-    fs = scn.profile.filing_status
-    state.cumulative_inflation *= (1.0 + inflation)
-    state.nominal_income *= (1.0 + scn.income.growth_rate) if year_idx > 0 else 1.0
-
-    gross = state.nominal_income
-    # Contribution caps (catchup at 50+)
-    catchup_401k = TAX_2024.contrib_limit_401k_catchup if age >= 50 else 0.0
-    catchup_ira = TAX_2024.contrib_limit_ira_catchup if age >= 50 else 0.0
-    limit_401k = TAX_2024.contrib_limit_401k + catchup_401k
-    limit_ira = TAX_2024.contrib_limit_ira + catchup_ira
-
-    c = scn.savings.contributions
-    trad_401k = min(_resolve_contrib(c.trad_401k, limit_401k), limit_401k, gross)
-    roth_401k = min(_resolve_contrib(c.roth_401k, limit_401k - trad_401k),
-                    limit_401k - trad_401k, gross - trad_401k)
-    trad_ira = min(_resolve_contrib(c.trad_ira, limit_ira), limit_ira)
-    roth_ira = min(_resolve_contrib(c.roth_ira, limit_ira - trad_ira),
-                   limit_ira - trad_ira)
-    employer_match = c.employer_match_rate * gross
-
-    # Deposit contributions BEFORE returns are applied this year (timing
-    # convention; contributions happen at start of year).
-    p.traditional.deposit(_alloc_dom_asset(targets.traditional), trad_401k + employer_match)
-    p.roth.deposit(_alloc_dom_asset(targets.roth), roth_401k)
-    # IRAs go to same accounts (we don't separate IRA from 401k).
-    p.traditional.deposit(_alloc_dom_asset(targets.traditional), trad_ira)
-    p.roth.deposit(_alloc_dom_asset(targets.roth), roth_ira, is_contribution=True)
-
-    # Apply returns first so this year's dividend income is included in the
-    # same tax bill as wages (avoids double-applying the standard deduction).
-    qual_div, ord_div = _apply_asset_returns(
-        p, returns_year, scn.market.to_market_model())
-
-    ord_income = max(0.0, gross - trad_401k - trad_ira) + ord_div
-    bill = compute_tax(
-        ordinary_income=ord_income, ltcg_income=qual_div, ss_benefit=0.0,
-        tax_exempt_interest=0.0, filing_status=fs,
-        state_marginal_rate=scn.profile.state_marginal_rate, ty=TAX_2024,
-    )
-    bill_total = bill.total
-
-    # After-tax take-home from wages (dividends are reinvested in the lots
-    # already; tax owed on them is paid out-of-band from taxable cash).
-    take_home = gross - trad_401k - bill.total - roth_401k - trad_ira - roth_ira
-    implied_living = (1.0 - scn.savings.rate) * gross
-    taxable_savings = max(0.0, take_home - implied_living)
-    _direct_taxable_deposit(p.taxable, taxable_savings, targets.taxable)
-
-    # Rebalance tax-advantaged accounts (free).
-    _rebalance_account_via_buys(p.traditional, targets.traditional)
-    _rebalance_account_via_buys(p.roth, targets.roth)
-
-    # Age lots
-    p.taxable.age(1.0)
-
-    real_wealth = p.total_value() / state.cumulative_inflation
-    real_taxes = bill_total / state.cumulative_inflation
-    return real_wealth, real_taxes
-
-
-def _alloc_dom_asset(target: Allocation) -> Asset:
-    """For deposits into tax-advantaged accounts we just deposit into the
-    most-target asset; rebalance step squares it up."""
-    t = target.as_dict()
-    return max(t, key=t.get)
-
-
-def _withdraw_from_taxable_for_taxes(taxable: TaxableAccount, amount: float,
-                                     target: Allocation
-                                     ) -> tuple[float, float, float]:
-    """Pay current-year tax from taxable account. Prefer cash, then bonds,
-    then stocks. Returns (paid, lt_realized, st_realized) where `paid` is
-    actual dollars sourced (may be less than `amount` if depleted)."""
-    if amount <= 0:
-        return 0.0, 0.0, 0.0
-    paid = lt = st = 0.0
-    for a in (Asset.CASH, Asset.BOND, Asset.STOCK):
-        if amount <= 0:
-            break
-        avail = taxable.value(a)
-        if avail <= 0:
-            continue
-        take = min(amount, avail)
-        proc, _lt, _st = taxable.sell_for(take, a)
-        paid += proc
-        lt += _lt
-        st += _st
-        amount -= proc
-    return paid, lt, st
-
-
-# ---------- decumulation ----------
-
-def _step_decumulation(scn: Scenario, p: Portfolio, age: int, year_idx: int,
-                       returns_year: dict[Asset, float], inflation: float,
-                       state: _AccumState,
-                       prior_year_end_trad: float
-                       ) -> tuple[float, float, float, float]:
-    """Run one decumulation year.
-
-    Returns (real_wealth_end, real_taxes, real_target_spend, real_shortfall).
-    """
-    targets = scn.target_allocations
-    fs = scn.profile.filing_status
-    state.cumulative_inflation *= (1.0 + inflation)
-
-    # Apply returns FIRST (start-of-year balance grows during the year before
-    # withdrawal — common convention).
-    qual_div, ord_div = _apply_asset_returns(p, returns_year, scn.market.to_market_model())
-
-    years_into_retire = age - scn.profile.retirement_age
-    factor = _spending_factor(years_into_retire, scn.spending.smile)
-    real_target_spend = scn.spending.annual_real * factor
-    nominal_target_spend = real_target_spend * state.cumulative_inflation
-
-    # Social Security (nominal, COLA'd by inflation since today)
-    ss_nominal = 0.0
-    if age >= scn.social_security.claim_age and scn.social_security.monthly_at_67 > 0:
-        # Adjust claim age vs 67: simplified linear PIA adjustment. Real users
-        # should set monthly_at_67 to their statement value.
-        ss_nominal = (scn.social_security.monthly_at_67 * 12.0
-                      * state.cumulative_inflation)
-
-    # 1) RMDs (forced traditional withdrawal)
-    rmd = required_min_distribution(age, prior_year_end_trad)
-    rmd_taken = p.traditional.withdraw(rmd) if rmd > 0 else 0.0
-
-    # Track ordinary income flowing into tax bill
-    ordinary_income = ord_div + rmd_taken
-    ltcg_income = qual_div
-
-    # 2) Optional Roth conversion ladder
-    wd = scn.withdrawal
-    conversion = 0.0
-    if (wd.roth_conversion_target_bracket is not None
-            and p.traditional.value() > 0):
-        # Target ordinary income at top of bracket
-        target_ordinary = top_of_bracket(wd.roth_conversion_target_bracket, fs)
-        # subtract std deduction since brackets apply to taxable income
-        target_gross = target_ordinary + TAX_2024.std_deduction[fs]
-        room = max(0.0, target_gross - (ordinary_income + ss_nominal * 0.85))
-        # ACA cap (modified AGI) — enforce only before Medicare age 65
-        if wd.aca_magi_cap is not None and age < 65:
-            room = min(room, max(0.0, wd.aca_magi_cap * state.cumulative_inflation
-                                 - (ordinary_income + ltcg_income + ss_nominal)))
-        conversion = min(room, p.traditional.value())
-        if conversion > 0:
-            p.traditional.withdraw(conversion)
-            # Convert to Roth (deposit at current target allocation)
-            p.roth.deposit(_alloc_dom_asset(targets.roth), conversion,
-                           is_contribution=False)
-            ordinary_income += conversion
-
-    # 3) Spending — withdraw to cover (target_spend - SS), gross-up for tax
-    net_need = max(0.0, nominal_target_spend - ss_nominal)
-    # Iteratively gross up: tax on incremental withdrawal depends on source.
-    # We do: 2 passes. Pass 1: withdraw at face. Pass 2: top up by computed tax.
-    withdrawals = _execute_withdrawal_strategy(
-        p, net_need, age, scn, ordinary_income, ltcg_income, ss_nominal,
-        state.cumulative_inflation,
-    )
-    ordinary_income += withdrawals.ordinary_added
-    ltcg_income += withdrawals.ltcg_added
-
-    bill = compute_tax(
-        ordinary_income=ordinary_income, ltcg_income=ltcg_income,
-        ss_benefit=ss_nominal, tax_exempt_interest=0.0,
-        filing_status=fs,
-        state_marginal_rate=scn.profile.state_marginal_rate, ty=TAX_2024,
-    )
-
-    # Pay taxes by drawing additional dollars from the same strategy.
-    # Don't double-withdraw (we treat withdrawals.gross as already covering
-    # net_need; tax is incremental).
-    paid, lt_extra, st_extra = _withdraw_from_taxable_for_taxes(
-        p.taxable, bill.total, targets.taxable)
-    ltcg_income += lt_extra
-    ordinary_income += st_extra
-    remaining_tax = bill.total - paid
-    if remaining_tax > 1e-6:
-        # Top up from tax-advantaged. Pre-59.5 prefer Roth basis (no penalty);
-        # 59.5+ prefer Traditional (already paying ordinary tax).
-        if age < 59.5 and p.roth.roth_basis > 0:
-            take = min(remaining_tax, p.roth.roth_basis)
-            p.roth.withdraw(take)
-            remaining_tax -= take
-        if remaining_tax > 0 and p.traditional.value() > 0:
-            take = min(remaining_tax, p.traditional.value())
-            p.traditional.withdraw(take)
-            remaining_tax -= take
-        if remaining_tax > 0 and p.roth.value() > 0:
-            take = min(remaining_tax, p.roth.value())
-            p.roth.withdraw(take)
-            remaining_tax -= take
-        # If still remaining, plan failed to pay tax -> reflect as shortfall.
-
-    # Funded amount = what we actually withdrew for spending + SS - any
-    # tax paid out of the spending withdrawal (we already paid tax
-    # separately above). So funded == withdrawals.gross + ss_nominal.
-    nominal_received = withdrawals.gross + ss_nominal
-    nominal_shortfall = max(0.0, nominal_target_spend - nominal_received) + remaining_tax
-    real_shortfall = nominal_shortfall / state.cumulative_inflation
-
-    # Rebalance tax-advantaged
-    _rebalance_account_via_buys(p.traditional, targets.traditional)
-    _rebalance_account_via_buys(p.roth, targets.roth)
-
-    p.taxable.age(1.0)
-
-    real_wealth = p.total_value() / state.cumulative_inflation
-    real_taxes = bill.total / state.cumulative_inflation
-    return real_wealth, real_taxes, real_target_spend, real_shortfall
-
-
-@dataclass
-class _WithdrawalResult:
-    gross: float           # total nominal withdrawn from accounts
-    ordinary_added: float  # added to ordinary income for the tax bill
-    ltcg_added: float      # added to LTCG for the tax bill
-
-
-def _execute_withdrawal_strategy(p: Portfolio, net_need: float, age: int,
-                                 scn: Scenario, ord_so_far: float,
-                                 ltcg_so_far: float, ss_nominal: float,
-                                 inflation_factor: float) -> _WithdrawalResult:
-    """Withdraw `net_need` nominal dollars (pre-tax). Returns income added
-    to the tax categories.
-
-    Strategy 'tax_aware':
-      Step A: Sell taxable lots (LT first, lowest gain first). Adds realized
-              LT gains to LTCG income.
-      Step B: If still need money, and age >= 59.5: traditional 401k.
-      Step C: If <59.5 and need more: Roth basis (penalty-free), then
-              taxable ST (penalty doesn't apply), then traditional w/ penalty
-              (we model the 10% penalty as additional tax).
-      Step D: 59.5+: Roth (last, to preserve tax-free compounding).
-    """
-    if net_need <= 0:
-        return _WithdrawalResult(0.0, 0.0, 0.0)
-    strategy = scn.withdrawal.strategy
-    targets = scn.target_allocations
-
-    gross = 0.0
-    ord_add = 0.0
-    ltcg_add = 0.0
-    remaining = net_need
-
-    if strategy == "proportional":
-        total = p.total_value()
-        if total > 0:
-            shares = {
-                "tax": p.taxable.value() / total,
-                "trad": p.traditional.value() / total,
-                "roth": p.roth.value() / total,
-            }
-            # Taxable
-            tx_take = remaining * shares["tax"]
-            for a in (Asset.STOCK, Asset.BOND, Asset.CASH):
-                if tx_take <= 0:
-                    break
-                avail = p.taxable.value(a)
-                if avail <= 0:
-                    continue
-                take = min(tx_take, avail)
-                _, _lt, _st = p.taxable.sell_for(take, a)
-                gross += take
-                ltcg_add += _lt
-                ord_add += _st
-                tx_take -= take
-            # Traditional
-            tr_take = min(remaining * shares["trad"], p.traditional.value())
-            p.traditional.withdraw(tr_take)
-            gross += tr_take
-            ord_add += tr_take
-            # Roth
-            ro_take = min(remaining * shares["roth"], p.roth.value())
-            p.roth.withdraw(ro_take)
-            gross += ro_take
-            return _WithdrawalResult(gross, ord_add, ltcg_add)
-
-    # Tax-aware (default) and ordered
-    # Step A: taxable
-    for a in (Asset.STOCK, Asset.BOND, Asset.CASH):
-        if remaining <= 0:
-            break
-        avail = p.taxable.value(a)
-        if avail <= 0:
-            continue
-        take = min(remaining, avail)
-        _, _lt, _st = p.taxable.sell_for(take, a)
-        gross += take
-        ltcg_add += _lt
-        ord_add += _st
-        remaining -= take
-
-    # Step B: if 59.5+, traditional next
-    if remaining > 0 and age >= 59.5 and p.traditional.value() > 0:
-        take = min(remaining, p.traditional.value())
-        p.traditional.withdraw(take)
-        gross += take
-        ord_add += take
-        remaining -= take
-
-    # Step C: pre-59.5 fallback — Roth basis, then traditional w/ penalty
-    if remaining > 0 and age < 59.5 and p.roth.roth_basis > 0:
-        take = min(remaining, p.roth.roth_basis)
-        p.roth.withdraw(take)
-        gross += take
-        remaining -= take
-    if remaining > 0 and age < 59.5 and p.traditional.value() > 0:
-        take = min(remaining, p.traditional.value())
-        p.traditional.withdraw(take)
-        gross += take
-        ord_add += take + 0.10 * take  # crude 10% penalty as extra ordinary
-        remaining -= take
-
-    # Step D: Roth (post-59.5 it's tax-free; pre-59.5 of earnings is taxed
-    # — we approximate as ordinary)
-    if remaining > 0 and p.roth.value() > 0:
-        take = min(remaining, p.roth.value())
-        p.roth.withdraw(take)
-        gross += take
-        if age < 59.5:
-            ord_add += take + 0.10 * take
-        remaining -= take
-
-    return _WithdrawalResult(gross, ord_add, ltcg_add)
-
-
-# ---------- top-level driver ----------
+# ---------- Top-level driver ----------
 
 def simulate(scn: Scenario,
              allocations: TargetAllocations | None = None,
              ) -> SimResult:
-    """Run Monte Carlo. Returns a SimResult."""
+    """Run a vectorised Monte Carlo. Returns the same SimResult interface as
+    the scalar version (so callers and tests don't change)."""
     if allocations is not None:
-        # local override (used by optimizer)
-        scn = _replace_allocations(scn, allocations)
+        from copy import deepcopy
+        scn = deepcopy(scn)
+        scn.target_allocations = allocations
 
     horizon = scn.profile.horizon()
-    n_paths = scn.simulation.n_paths
+    P = scn.simulation.n_paths
     seed = scn.simulation.seed
     market = scn.market.to_market_model()
 
-    returns = sample_gbm_paths(market, horizon, n_paths, seed=seed)
-    inflation = sample_inflation(market, horizon, n_paths, seed=(seed or 0) + 1)
+    returns_by_asset = sample_gbm_paths(market, horizon, P, seed=seed)
+    inflation = sample_inflation(market, horizon, P, seed=(seed or 0) + 1)
+    # Stack into (P, H, 3) for per-asset access by index
+    R = np.stack([returns_by_asset[Asset.STOCK],
+                  returns_by_asset[Asset.BOND],
+                  returns_by_asset[Asset.CASH]], axis=-1)  # (P, H, 3)
 
+    s = VState.from_portfolio(scn.initial_portfolio, P, horizon,
+                              starting_nominal_income=scn.income.current_gross)
+
+    targets_taxable = _alloc_to_array(scn.target_allocations.taxable)
+    targets_trad = _alloc_to_array(scn.target_allocations.traditional)
+    targets_roth = _alloc_to_array(scn.target_allocations.roth)
+
+    # Yield fractions per asset (taxable account)
+    yf = np.array([market.yield_fraction[a] for a in ASSET_ORDER])
+
+    fs = scn.profile.filing_status
+    timeline: StateTimeline = scn.state_taxes  # see config update below
+
+    for y in range(horizon):
+        age = scn.profile.age + y
+        ret_y = R[:, y, :]   # (P, 3)
+        infl_y = inflation[:, y]  # (P,)
+        s.cumulative_inflation *= (1.0 + infl_y)
+
+        if age < scn.profile.retirement_age:
+            _step_accumulation(s, scn, age, y, ret_y, fs, timeline,
+                               targets_taxable, targets_trad, targets_roth, yf)
+        else:
+            _step_decumulation(s, scn, age, y, ret_y, fs, timeline,
+                               targets_taxable, targets_trad, targets_roth, yf)
+        s.age_st_to_lt()
+        s.real_wealth[:, y + 1] = s.total_value() / s.cumulative_inflation
+        # Mark failed paths (zero wealth past retirement counts as failure)
+        if age >= scn.profile.retirement_age:
+            s.failed |= (s.total_value() <= 0)
+
+    # Build per-path PathResult objects from arrays
     paths: list[PathResult] = []
-    for i in range(n_paths):
-        p = deepcopy(scn.initial_portfolio)
-        state = _AccumState(nominal_income=scn.income.current_gross,
-                            cumulative_inflation=1.0)
-        wealth = np.empty(horizon + 1)
-        wealth[0] = p.total_value()
-        spend = np.zeros(horizon)
-        short = np.zeros(horizon)
-        total_real_tax = 0.0
-        failed = False
-        prior_trad_end = p.traditional.value()
-
-        for y in range(horizon):
-            age = scn.profile.age + y
-            ret_y = {Asset.STOCK: returns[Asset.STOCK][i, y],
-                     Asset.BOND:  returns[Asset.BOND][i, y],
-                     Asset.CASH:  returns[Asset.CASH][i, y]}
-            infl_y = inflation[i, y]
-            if age < scn.profile.retirement_age:
-                rw, rt = _step_accumulation(scn, p, age, y, ret_y, infl_y, state)
-                spend[y] = 0.0
-            else:
-                rw, rt, ts, sh = _step_decumulation(
-                    scn, p, age, y, ret_y, infl_y, state, prior_trad_end,
-                )
-                spend[y] = ts
-                short[y] = sh
-                if p.total_value() <= 0:
-                    failed = True
-            total_real_tax += rt
-            wealth[y + 1] = p.total_value() / state.cumulative_inflation
-            prior_trad_end = p.traditional.value()
-            if failed:
-                # zero out remaining
-                wealth[y + 1:] = 0.0
-                short[y + 1:] = scn.spending.annual_real
-                break
-
+    for i in range(P):
         paths.append(PathResult(
-            terminal_real_wealth=wealth[-1],
-            real_wealth_by_year=wealth,
-            real_spending_by_year=spend,
-            real_shortfall_by_year=short,
-            lifetime_real_tax=total_real_tax,
-            failed=failed,
+            terminal_real_wealth=float(s.real_wealth[i, -1]),
+            real_wealth_by_year=s.real_wealth[i].copy(),
+            real_spending_by_year=s.real_target_spend[i].copy(),
+            real_shortfall_by_year=s.real_shortfall[i].copy(),
+            lifetime_real_tax=float(s.real_taxes[i].sum()),
+            failed=bool(s.failed[i]),
         ))
     return SimResult(paths=paths)
 
 
-def _replace_allocations(scn: Scenario, allocations: TargetAllocations) -> Scenario:
-    """Return a copy of scn with replaced target_allocations."""
-    new = deepcopy(scn)
-    new.target_allocations = allocations
-    return new
+# ---------- Per-year accumulation step ----------
+
+def _step_accumulation(s: VState, scn: Scenario, age: int, year_idx: int,
+                       returns_y: np.ndarray, fs: FilingStatus,
+                       timeline: StateTimeline,
+                       tgt_tax: np.ndarray, tgt_trad: np.ndarray,
+                       tgt_roth: np.ndarray, yf: np.ndarray) -> None:
+    """Vectorised accumulation year, in-place mutation of s."""
+    # 1) Income grows (year_idx > 0 only; year 0 keeps starting income)
+    if year_idx > 0:
+        s.nominal_income *= (1.0 + scn.income.growth_rate)
+
+    # 2) Returns: stock/bond/cash. Yield gets sold/reinvested as new ST cohort
+    # in taxable; tax-advantaged just compound.
+    s.trad_balance *= (1.0 + returns_y)
+    s.roth_balance *= (1.0 + returns_y)
+
+    pos_ret = np.maximum(0.0, returns_y)         # (P, 3)
+    yield_amt_lt = s.tax_lt_value * pos_ret * yf  # (P, 3)
+    yield_amt_st = s.tax_st_value * pos_ret * yf
+    appreciation = returns_y - pos_ret * yf       # (P, 3)
+    s.tax_lt_value *= (1.0 + appreciation)
+    s.tax_st_value *= (1.0 + appreciation)
+    yield_amt = yield_amt_lt + yield_amt_st       # (P, 3) total dividend cash
+    s.tax_st_value += yield_amt
+    s.tax_st_basis += yield_amt
+    qual_div = yield_amt[:, 0]                    # stocks
+    ord_div = yield_amt[:, 1] + yield_amt[:, 2]   # bonds + cash
+
+    # 3) Contributions
+    catchup_401k = TAX_2024.contrib_limit_401k_catchup if age >= 50 else 0.0
+    catchup_ira = TAX_2024.contrib_limit_ira_catchup if age >= 50 else 0.0
+    limit_401k = TAX_2024.contrib_limit_401k + catchup_401k
+    limit_ira = TAX_2024.contrib_limit_ira + catchup_ira
+    # 415(c) overall annual additions limit (for mega-backdoor):
+    # 2024 = $69,000 + catchup. Approximate as 69k regardless of age (catchup
+    # is in trad limit already).
+    total_415c = 69_000.0 + catchup_401k
+
+    c = scn.savings.contributions
+    trad_401k = min(_resolve_contrib_value(c.trad_401k, limit_401k), limit_401k)
+    roth_401k_room = max(0.0, limit_401k - trad_401k)
+    roth_401k = min(_resolve_contrib_value(c.roth_401k, roth_401k_room),
+                    roth_401k_room)
+    trad_ira = min(_resolve_contrib_value(c.trad_ira, limit_ira), limit_ira)
+    roth_ira = min(_resolve_contrib_value(c.roth_ira, limit_ira - trad_ira),
+                   limit_ira - trad_ira)
+    employer_match = c.employer_match_rate * s.nominal_income  # (P,) — pre-tax
+
+    # Mega-backdoor Roth: post-tax 401k -> Roth conversion within plan.
+    # Limited to 415(c) - employee_pretax - employer_match (approx).
+    # Configured as a fixed dollar amount or 'max'.
+    mbdr_room = np.maximum(
+        0.0, total_415c - trad_401k - roth_401k - employer_match)
+    if isinstance(c.mega_backdoor_roth, str) and c.mega_backdoor_roth == "max":
+        mbdr = mbdr_room  # (P,)
+    else:
+        mbdr = np.full(s.n_paths, float(c.mega_backdoor_roth))
+        mbdr = np.minimum(mbdr, mbdr_room)
+
+    # Deposit pre-tax contributions (Traditional 401k + employer + Trad IRA)
+    pretax_trad = trad_401k + trad_ira  # scalar
+    s.trad_balance += pretax_trad * tgt_trad[None, :]
+    s.trad_balance += employer_match[:, None] * tgt_trad[None, :]
+    # Roth contributions
+    roth_direct = roth_401k + roth_ira  # scalar
+    s.roth_balance += roth_direct * tgt_roth[None, :]
+    s.roth_basis += roth_direct
+    # Mega-backdoor: post-tax money going into Roth — counts as Roth basis
+    # (technically as conversion-of-after-tax with its own 5y clock; we model
+    # as basis since both are penalty-free principal).
+    s.roth_balance += mbdr[:, None] * tgt_roth[None, :]
+    s.roth_basis += mbdr
+
+    # 4) Income tax
+    # Wages-only (subject to employment-state tax).
+    wages = s.nominal_income - trad_401k - trad_ira  # post-pre-tax wages
+    wages = np.maximum(wages, 0.0)
+    # Mega-backdoor isn't deducted from W-2 wages (it's already after-tax
+    # deferral); modeled as paid out of take-home.
+    ord_income_fed = wages + ord_div  # ordinary income for federal
+    ltcg_income = qual_div  # qualified divs at LTCG rates
+
+    fed_tax, _ = _federal_tax_vec(ord_income_fed, ltcg_income,
+                                  np.zeros(s.n_paths), fs)
+    # State tax: split wages from other income for multi-state residency.
+    state_tax = multi_state_tax_vec(
+        ordinary_income_wages=wages,
+        ordinary_income_other=ord_div,
+        ltcg_income=ltcg_income,
+        age=age, filing_status=fs, timeline=timeline,
+    )
+    bill_total = fed_tax + state_tax
+
+    # 5) Take-home and taxable savings
+    take_home = (s.nominal_income - trad_401k - trad_ira - roth_direct
+                 - mbdr - bill_total)
+    implied_living = (1.0 - scn.savings.rate) * s.nominal_income
+    taxable_savings = np.maximum(0.0, take_home - implied_living)
+    deposit_taxable_st_split(s, taxable_savings, tgt_taxable_array(tgt_tax))
+
+    # 6) Pay tax on dividends generated this year out of taxable cash if any.
+    # Already included in bill_total but we deduct that amount from cash
+    # explicitly (it's been "spent" on taxes).
+    # Reduce taxable account by tax owed (paid from cash first, etc.)
+    _, _, _ = withdraw_taxable_for_spending(s, np.zeros(s.n_paths))
+    # The tax was already included in `take_home` above; no additional sale
+    # is needed during accumulation since wages cover it.
+
+    # 7) Rebalance tax-advantaged to target (free)
+    _rebalance_to_target(s.trad_balance, tgt_trad)
+    _rebalance_to_target(s.roth_balance, tgt_roth)
+
+    # 8) Outputs
+    s.real_taxes[:, year_idx] = bill_total / s.cumulative_inflation
+
+
+def tgt_taxable_array(arr: np.ndarray) -> np.ndarray:
+    """Identity helper to make intent clear at call sites."""
+    return arr
+
+
+def _rebalance_to_target(balances: np.ndarray, target: np.ndarray) -> None:
+    """Rebalance a (P, 3) balance array to target (3,) within total. In-place.
+    Floors at zero — depleted accounts shouldn't reflect negative drift from
+    floating-point rounding."""
+    total = np.maximum(0.0, balances.sum(-1, keepdims=True))
+    balances[:] = total * target[None, :]
+
+
+# ---------- Per-year decumulation step ----------
+
+def _step_decumulation(s: VState, scn: Scenario, age: int, year_idx: int,
+                       returns_y: np.ndarray, fs: FilingStatus,
+                       timeline: StateTimeline,
+                       tgt_tax: np.ndarray, tgt_trad: np.ndarray,
+                       tgt_roth: np.ndarray, yf: np.ndarray) -> None:
+    """Vectorised decumulation year, in-place mutation of s."""
+    P = s.n_paths
+    # 1) Returns
+    s.trad_balance *= (1.0 + returns_y)
+    s.roth_balance *= (1.0 + returns_y)
+    pos_ret = np.maximum(0.0, returns_y)
+    yield_amt = (s.tax_lt_value + s.tax_st_value) * pos_ret * yf
+    appreciation = returns_y - pos_ret * yf
+    s.tax_lt_value *= (1.0 + appreciation)
+    s.tax_st_value *= (1.0 + appreciation)
+    s.tax_st_value += yield_amt
+    s.tax_st_basis += yield_amt
+    qual_div = yield_amt[:, 0]
+    ord_div = yield_amt[:, 1] + yield_amt[:, 2]
+
+    # 2) Spending target (real, then nominal)
+    years_into_retire = age - scn.profile.retirement_age
+    factor = _spending_smile_factor(years_into_retire, scn.spending.smile)
+    real_target = scn.spending.annual_real * factor
+    s.real_target_spend[:, year_idx] = real_target
+    nominal_target = real_target * s.cumulative_inflation
+
+    # 3) Social Security (in nominal; COLA'd by realised inflation)
+    ss_nominal = np.zeros(P)
+    if (age >= scn.social_security.claim_age
+            and scn.social_security.monthly_at_67 > 0):
+        ss_nominal = (scn.social_security.monthly_at_67 * 12.0
+                      * s.cumulative_inflation)
+
+    # 4) RMDs (forced traditional withdrawal)
+    rmd_amt = np.zeros(P)
+    if age >= RMD_START_AGE:
+        # Use prior year-end balance approximation = current balance pre-withdrawal
+        prior_trad = s.trad_balance.sum(-1)
+        divisor = RMD_DIVISORS.get(min(age, max(RMD_DIVISORS)), 6.0)
+        rmd_amt = prior_trad / divisor
+    rmd_taken = withdraw_traditional(s, rmd_amt)
+
+    ord_income = ord_div + rmd_taken
+    ltcg_income = qual_div
+
+    # 5) Roth conversion ladder
+    wd = scn.withdrawal
+    if wd.roth_conversion_target_bracket is not None:
+        target_ord_taxable = top_of_bracket(wd.roth_conversion_target_bracket, fs)
+        target_gross = target_ord_taxable + TAX_2024.std_deduction[fs]
+        room = np.maximum(0.0, target_gross
+                          - (ord_income + ss_nominal * 0.85))
+        if wd.aca_magi_cap is not None and age < 65:
+            cap_nominal = wd.aca_magi_cap * s.cumulative_inflation
+            room = np.minimum(room, np.maximum(
+                0.0, cap_nominal - (ord_income + ltcg_income + ss_nominal)))
+        conv = np.minimum(room, s.trad_balance.sum(-1))
+        # Withdraw from traditional, deposit into Roth, record conversion
+        actual_conv = withdraw_traditional(s, conv)
+        s.roth_balance += actual_conv[:, None] * tgt_roth[None, :]
+        s.roth_conversions[:, year_idx] += actual_conv
+        ord_income += actual_conv
+
+    # 6) Spending withdrawal
+    net_need = np.maximum(0.0, nominal_target - ss_nominal)
+    proceeds, lt_g, st_g = _execute_withdrawal_strategy(
+        s, net_need, age, year_idx, scn)
+    ltcg_income += lt_g
+    ord_income += st_g
+
+    # 7) Tax bill (federal + state)
+    fed_tax, _ = _federal_tax_vec(ord_income, ltcg_income, ss_nominal, fs)
+    # In retirement, no wages -> all "ord_income" is investment-derived,
+    # taxed by state of residence.
+    state_tax = multi_state_tax_vec(
+        ordinary_income_wages=np.zeros(P),
+        ordinary_income_other=ord_income,
+        ltcg_income=ltcg_income,
+        age=age, filing_status=fs, timeline=timeline,
+    )
+    bill_total = fed_tax + state_tax
+
+    # 8) Pay tax: another withdrawal pass for the tax dollars
+    paid, lt_g2, st_g2 = withdraw_taxable_for_spending(s, bill_total)
+    remaining_tax = bill_total - paid
+    if (remaining_tax > 0).any():
+        # Try traditional (post-59.5 only — pre-59.5 hits penalty)
+        if age >= 59.5:
+            pulled = withdraw_traditional(s, remaining_tax)
+            remaining_tax -= pulled
+        if (remaining_tax > 0).any():
+            r_proc, r_ord, r_pen = withdraw_roth(s, remaining_tax, year_idx, age)
+            remaining_tax -= r_proc
+
+    # 9) Compute shortfall
+    received = proceeds + ss_nominal
+    shortfall = np.maximum(0.0, nominal_target - received) + remaining_tax
+    s.real_shortfall[:, year_idx] = shortfall / s.cumulative_inflation
+
+    # 10) Rebalance tax-advantaged
+    _rebalance_to_target(s.trad_balance, tgt_trad)
+    _rebalance_to_target(s.roth_balance, tgt_roth)
+
+    s.real_taxes[:, year_idx] = bill_total / s.cumulative_inflation
+
+
+def _execute_withdrawal_strategy(s: VState, net_need: np.ndarray, age: int,
+                                 year_idx: int, scn: Scenario
+                                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Tax-aware withdrawal:
+        Step A: taxable (cash -> bond -> stock; LT first)
+        Step B: 59.5+ -> traditional next
+        Step C: <59.5 -> Roth (basis, mature conversions, green w/ penalty,
+                         earnings w/ penalty + ordinary tax)
+        Step D: 59.5+ -> Roth last (tax-free)
+    Returns (gross_proceeds, lt_gain_added, st_gain_added) all (P,).
+    Gains added are realised gains created by sales in the taxable account.
+    Roth-related ordinary income from earnings is folded into the caller's
+    tax computation via withdraw_roth's `ord_add`.
+    """
+    P = s.n_paths
+    remaining = net_need.copy()
+    gross = np.zeros(P)
+    lt_g = np.zeros(P)
+    st_g = np.zeros(P)
+
+    # Step A
+    proc, lt, st = withdraw_taxable_for_spending(s, remaining)
+    gross += proc
+    lt_g += lt
+    st_g += st
+    remaining -= proc
+
+    # Step B: 59.5+ -> traditional
+    if age >= 59.5 and (remaining > 0).any():
+        pulled = withdraw_traditional(s, remaining)
+        gross += pulled
+        # Traditional withdrawals are ordinary income; caller's tax bill
+        # already includes them via the prior `ord_income` accumulation. To
+        # signal this, we add to st_g (which the caller treats as ordinary).
+        # Better: use a dedicated channel. For simplicity:
+        st_g += pulled
+        remaining -= pulled
+
+    # Step C / D: Roth
+    if (remaining > 0).any():
+        r_proc, r_ord, r_pen = withdraw_roth(s, remaining, year_idx, age)
+        gross += r_proc
+        st_g += r_ord + r_pen  # ordinary tax + penalty added to ord
+        remaining -= r_proc
+
+    # Step E (fallback): pre-59.5 traditional with 10% penalty
+    if age < 59.5 and (remaining > 0).any():
+        pulled = withdraw_traditional(s, remaining)
+        gross += pulled
+        st_g += pulled + 0.10 * pulled  # ordinary + penalty
+        remaining -= pulled
+
+    return gross, lt_g, st_g

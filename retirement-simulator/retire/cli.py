@@ -11,8 +11,11 @@ import typer
 
 from .accounts import Asset
 from .config import load_scenario
+from .location import (heuristic_target_allocations, overall_allocation_of,
+                       tax_efficient_dollars)
 from .simulate import simulate
 from .optimize import optimize, OptimizerConfig
+from .state_taxes import state_tax, STATES
 from .taxes import compute_tax, TAX_2024
 
 
@@ -68,11 +71,17 @@ def optimize_cmd(
     popsize: int = typer.Option(12, help="DE population size."),
     workers: int = typer.Option(1, help="Parallel workers (>=1)."),
     final_paths: int = typer.Option(5000, help="MC paths for final report."),
+    location_mode: str = typer.Option(
+        "free",
+        help="'free' (8 vars) or 'heuristic' (4 vars, location fixed by tax-"
+             "efficient placement).",
+    ),
 ) -> None:
     """Optimize allocation and contribution split for the scenario."""
     scn = load_scenario(config)
     cfg = OptimizerConfig(gamma=gamma, n_paths_inner=paths, maxiter=maxiter,
-                         popsize=popsize, workers=workers)
+                         popsize=popsize, workers=workers,
+                         location_mode=location_mode)
     print("Running differential evolution... (this can take a few minutes)")
     allocations, conv_bracket, trad_split, diag = optimize(scn, cfg)
     print("\n=== Optimal allocations ===")
@@ -101,15 +110,62 @@ def tax(
     ltcg: float = typer.Option(0.0, help="LT capital gains + qualified dividends."),
     ss: float = typer.Option(0.0, help="Annual Social Security benefit."),
     filing: str = typer.Option("single", help="single or mfj"),
-    state_rate: float = typer.Option(0.0, help="State marginal rate."),
+    state: str = typer.Option("NONE", help=f"State: one of {sorted(STATES.keys())}"),
 ) -> None:
     """Compute a 2024 federal+state tax bill for given income."""
+    state = state.upper()
+    if state not in STATES:
+        raise typer.BadParameter(f"unknown state {state}; supported: {sorted(STATES.keys())}")
+    st_tax = state_tax(state=state, ordinary_income=ordinary,
+                       ltcg_income=ltcg, filing_status=filing)
     bill = compute_tax(
         ordinary_income=ordinary, ltcg_income=ltcg, ss_benefit=ss,
         tax_exempt_interest=0.0, filing_status=filing,
-        state_marginal_rate=state_rate, ty=TAX_2024,
+        state_marginal_rate=0.0, ty=TAX_2024,
     )
     print(bill)
+    print(f"  State ({state})    ${st_tax:>10,.0f}")
+    print(f"  GRAND TOTAL       ${bill.total + st_tax:>10,.0f}")
+
+
+@app.command()
+def location(
+    config: Path = typer.Argument(..., exists=True, readable=True),
+    stock: float = typer.Option(0.70, help="Overall stock fraction."),
+    bond: float = typer.Option(0.25, help="Overall bond fraction."),
+    cash: float | None = typer.Option(None, help="Overall cash fraction "
+                                      "(default = 1 - stock - bond)."),
+) -> None:
+    """Compute the tax-efficient asset-location placement for a given
+    overall (stock, bond, cash) target, against the scenario's current
+    account totals."""
+    scn = load_scenario(config)
+    if cash is None:
+        cash = 1.0 - stock - bond
+    p = scn.initial_portfolio
+    placement = tax_efficient_dollars(
+        stock, bond, cash,
+        p.taxable.value(), p.traditional.value(), p.roth.value(),
+    )
+    print(f"Overall target:  stock {100*stock:.1f}%  bond {100*bond:.1f}%  "
+          f"cash {100*cash:.1f}%  (total ${p.total_value():,.0f})")
+    print()
+    print(f"{'account':<12} {'stock':>14} {'bond':>14} {'cash':>14} {'total':>14}")
+    for acc in ("taxable", "traditional", "roth"):
+        d = placement[acc]
+        tot = d["stock"] + d["bond"] + d["cash"]
+        print(f"{acc:<12} ${d['stock']:>12,.0f} ${d['bond']:>12,.0f} "
+              f"${d['cash']:>12,.0f} ${tot:>12,.0f}")
+    targets = heuristic_target_allocations(
+        stock, bond, cash,
+        p.taxable.value(), p.traditional.value(), p.roth.value(),
+    )
+    print()
+    print("Per-account fractional allocations (use these in target_allocations:):")
+    for name, a in [("taxable", targets.taxable),
+                    ("traditional", targets.traditional),
+                    ("roth", targets.roth)]:
+        print(f"  {name:<12} stock={a.stock:.4f}  bond={a.bond:.4f}  cash={a.cash:.4f}")
 
 
 @app.command()

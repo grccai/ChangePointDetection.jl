@@ -8,7 +8,19 @@ profile:
   retirement_age: 50
   end_of_plan_age: 95
   filing_status: single        # 'single' or 'mfj'
-  state_marginal_rate: 0.05    # flat state tax rate (set 0.0 for no-tax state)
+
+# State income tax. Two equivalent forms:
+#   Shorthand (one state your whole life):
+#     state_taxes: {state: CA}
+#   Full form (multi-state with optional overlap):
+state_taxes:
+  residency:
+    - {state: CA, start_age: 35, end_age: 50}      # live in CA while working
+    - {state: WA, start_age: 50, end_age: 95}      # move to WA at FIRE
+  employment:
+    - {state: CA, start_age: 35, end_age: 45}      # work in CA
+    - {state: WA, start_age: 45, end_age: 50, weight: 0.5}  # split job at 45
+    - {state: CA, start_age: 45, end_age: 50, weight: 0.5}
 
 income:
   current_gross: 200000
@@ -21,6 +33,7 @@ savings:
     roth_401k: 0
     trad_ira: 0
     roth_ira: 7000             # backdoor implicit if income is high
+    mega_backdoor_roth: max    # after-tax 401k -> Roth (up to 415(c) limit)
     employer_match_rate: 0.05  # 5% of gross matched into traditional 401k
 
 # Annual real spending in retirement (today's dollars). Inflation-adjusted
