@@ -133,4 +133,12 @@ simulation:
 # nominal at the date using realised cumulative inflation. Estate tax not
 # modelled — `amount_real` is the net received.
 inheritances:
-  - {date: 2059-05-05, amount_real: 1000000, account: taxable}   # age 70
+  # Benefactor currently age 65 (born ~1961). Each MC path samples its own
+  # arrival year from a Gompertz hazard tuned to a healthy 65yo (qx(65)≈0.5%,
+  # median age at death ≈ 92). Paths where the benefactor outlives the
+  # plan horizon (to ~ user age 95 = benefactor age 123) get no inheritance.
+  - amount_real: 1000000
+    account: taxable
+    hazard:
+      profile: healthy_65
+      current_age: 65

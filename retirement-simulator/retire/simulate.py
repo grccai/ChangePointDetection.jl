@@ -171,19 +171,15 @@ def _record_balances(s: VState, year_idx: int) -> None:
     s.real_balance_by_year[:, year_idx, 2, :] = roth_real
 
 
-def _deposit_inheritance(s: VState, scn: Scenario, inh, year_idx: int) -> None:
-    """Deposit a one-time inheritance into the configured account.
+def _deposit_inheritance(s: VState, scn: Scenario, inh, year_idx: int,
+                          mask: np.ndarray) -> None:
+    """Deposit a one-time inheritance into the configured account, but only
+    for the paths in `mask` (boolean (P,)).
 
-    Real -> nominal via realised cumulative inflation. Allocation across
-    stock/bond/cash uses the scenario's *configured* per-account targets
-    (we don't have the policy's year-specific decision here cheaply, but
-    deposit allocation is a minor effect — the account-level rebalance step
-    later in the year squares it back to target if applicable).
-    """
-    nominal = inh.amount_real * s.cumulative_inflation  # (P,)
+    Real -> nominal via each path's realised cumulative inflation."""
+    nominal = inh.amount_real * s.cumulative_inflation * mask    # (P,)
     if inh.account == "taxable":
         tgt = _alloc_to_array(scn.target_allocations.taxable)
-        # Fresh basis: cost_basis = market_value (no embedded gain).
         for ai in range(N_ASSETS):
             amt = nominal * tgt[ai]
             s.tax_st_value[:, ai] += amt
@@ -267,6 +263,38 @@ def simulate(scn: Scenario,
     # initial portfolio is a single specimen.
     _record_balances(s, year_idx=0)
 
+    # Pre-sample per-path inheritance arrival years.
+    # For deterministic Inheritance: same year_idx for every path.
+    # For Gompertz hazard: sample each path independently; paths where the
+    # benefactor outlives the horizon get year_idx = -1 (no deposit).
+    inh_arrival = []   # list[(P,)] arrays, parallel to scn.inheritances
+    inh_rng = np.random.default_rng((seed or 0) + 7)
+    for inh in scn.inheritances:
+        if inh.hazard is not None:
+            b, c = inh.hazard.resolved()
+            u = np.clip(inh_rng.uniform(size=P), 1e-12, 1 - 1e-12)
+            # Inverse-CDF for age at death given alive at current_age:
+            #   exp(c·x) = exp(c·a) − (c/b)·log(1 − U)
+            inner = np.exp(c * inh.hazard.current_age) - (c / b) * np.log(1 - u)
+            death_age = np.log(inner) / c
+            years_from_now = death_age - inh.hazard.current_age
+            year_idx_per_path = np.round(years_from_now).astype(int)
+            # Mark out-of-horizon paths with -1
+            year_idx_per_path = np.where(
+                year_idx_per_path >= horizon, -1, year_idx_per_path)
+            year_idx_per_path = np.maximum(0, year_idx_per_path)
+        else:
+            year_lo, _ = scn.state_taxes.year_window(scn.profile.start_date, 0)
+            # find which sim year contains inh.date
+            target = -1
+            for y in range(horizon):
+                lo, hi = scn.state_taxes.year_window(scn.profile.start_date, y)
+                if lo <= inh.date < hi:
+                    target = y
+                    break
+            year_idx_per_path = np.full(P, target, dtype=int)
+        inh_arrival.append(year_idx_per_path)
+
     yf = np.array([market.yield_fraction[a] for a in ASSET_ORDER])
 
     fs = scn.profile.filing_status
@@ -281,12 +309,11 @@ def simulate(scn: Scenario,
         infl_y = inflation[:, y]
         s.cumulative_inflation *= (1.0 + infl_y)
 
-        # ---- inheritance deposits whose date falls in this year window ----
-        if scn.inheritances:
-            year_lo, year_hi = timeline.year_window(sim_start, y)
-            for inh in scn.inheritances:
-                if year_lo <= inh.date < year_hi:
-                    _deposit_inheritance(s, scn, inh, y)
+        # ---- inheritance deposits for paths whose sampled arrival is y ----
+        for inh, arrivals in zip(scn.inheritances, inh_arrival):
+            mask = (arrivals == y)
+            if mask.any():
+                _deposit_inheritance(s, scn, inh, y, mask)
 
         # ---- query policy with current state summary ----
         if y == 0:

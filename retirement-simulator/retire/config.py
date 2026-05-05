@@ -218,28 +218,69 @@ class SimulationParams:
 
 
 @dataclass
-class Inheritance:
-    """One-time lump-sum deposit to a specified account at the given date.
+class GompertzHazard:
+    """Gompertz survival model for the benefactor's remaining lifetime.
+    Hazard h(age) = b * exp(c * age); per-path arrival year for the
+    inheritance is sampled by inverse-CDF given the benefactor's
+    current_age.
 
-    `amount_real` is in today's dollars and is converted to nominal using
-    realised cumulative inflation at the deposit date.
+    Defaults (`profile="healthy_65"`): tuned so qx(65) ≈ 0.005 (matching
+    SOA Healthy Annuitant 2012 IAM, midway between male and female), and
+    median age at death ≈ 92. Use `profile="average_65"` for population
+    mortality (qx(65) ≈ 0.015, median death ≈ 84).
+    """
+    current_age: float = 65.0   # benefactor's age at sim_start
+    profile: Literal["healthy_65", "average_65", "custom"] = "healthy_65"
+    b: float | None = None       # Gompertz baseline; required if profile=custom
+    c: float | None = None       # Gompertz slope; required if profile=custom
+
+    def resolved(self) -> tuple[float, float]:
+        """Return (b, c). Picks profile defaults if custom params unset."""
+        if self.profile == "custom":
+            if self.b is None or self.c is None:
+                raise ValueError("custom Gompertz requires b and c")
+            return self.b, self.c
+        if self.profile == "healthy_65":
+            # qx(65)=0.005, median death ≈ 92
+            return 2.4e-5, 0.085
+        if self.profile == "average_65":
+            # population-level: qx(65)=0.015, median death ≈ 84
+            return 7.0e-5, 0.085
+        raise ValueError(f"unknown profile: {self.profile}")
+
+
+@dataclass
+class Inheritance:
+    """One-time lump-sum deposit to a specified account.
+
+    Timing: either deterministic (`date`) OR stochastic (`hazard`). Exactly
+    one must be provided. With `hazard`, each MC path samples its own
+    arrival year from the survival distribution; paths where the benefactor
+    outlives the simulation horizon don't receive the inheritance.
+
+    `amount_real` is in today's dollars; converted to nominal at deposit
+    using realised cumulative inflation.
 
     Account treatment:
-      * `taxable`     — deposited as a fresh tax lot with basis = market value
-                        (mirrors cash receipt or stepped-up-basis from estate).
-                        Allocated across stock/bond/cash per the current
-                        per-account allocation policy at that year.
-      * `traditional` — added to the Traditional balance. Note: inherited
-                        IRAs are subject to the SECURE Act 10-year drawdown
-                        rule, NOT modelled here; treat with caution.
+      * `taxable`     — fresh tax lot at basis = market value (stepped-up
+                        from estate, or cash receipt). Allocated per the
+                        scenario's taxable target at deposit time.
+      * `traditional` — added to Trad balance. Inherited-IRA SECURE Act
+                        10-year drawdown is NOT modelled.
       * `roth`        — added to Roth balance and to roth_basis (treated as
                         penalty-free principal).
 
     Estate / inheritance tax is NOT modelled — `amount_real` is the net
     received after any estate-side taxes."""
-    date: _dt.date
     amount_real: float
     account: Literal["taxable", "traditional", "roth"] = "taxable"
+    date: _dt.date | None = None
+    hazard: GompertzHazard | None = None
+
+    def __post_init__(self) -> None:
+        if (self.date is None) == (self.hazard is None):
+            raise ValueError("Inheritance must specify exactly one of "
+                             "`date` (deterministic) or `hazard` (stochastic)")
 
 
 @dataclass
@@ -424,11 +465,18 @@ def load_scenario(path: str | Path) -> Scenario:
 
     inheritances: list[Inheritance] = []
     for inh in raw.get("inheritances", []):
-        inheritances.append(Inheritance(
-            date=_to_date(inh["date"]),
-            amount_real=float(inh["amount_real"]),
-            account=inh.get("account", "taxable"),
-        ))
+        kwargs = dict(amount_real=float(inh["amount_real"]),
+                      account=inh.get("account", "taxable"))
+        if "date" in inh:
+            kwargs["date"] = _to_date(inh["date"])
+        if "hazard" in inh:
+            h = inh["hazard"]
+            kwargs["hazard"] = GompertzHazard(
+                current_age=float(h.get("current_age", 65.0)),
+                profile=h.get("profile", "healthy_65"),
+                b=h.get("b"), c=h.get("c"),
+            )
+        inheritances.append(Inheritance(**kwargs))
 
     return Scenario(
         profile=profile, state_taxes=timeline,
