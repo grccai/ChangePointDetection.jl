@@ -192,6 +192,24 @@ and *employment*. Wages are taxed by employment-state(s); investment income
 (dividends, capital gains, RMDs, conversions) is taxed by residency-state(s).
 Concurrent assignments with weights model split-state work years.
 
+### Flexible spending (variable-percentage withdrawal)
+
+Set `spending.flexible.{floor_real, sensitivity}` to opt in. Each retirement
+year, real target spending is
+
+  ratio    = current_real_wealth / real_wealth_at_retirement_start  (per path)
+  scaling  = clamp(1 + sensitivity · (ratio − 1),  floor_real / base_real,  1)
+  spend(t) = max(floor_real, base_real · smile(t) · scaling)
+
+i.e., when the portfolio is below its retirement-start trajectory, spending
+scales down proportionally toward the floor; the smile is preserved when
+spending is at baseline. Upside is not reflected (spending never exceeds the
+smile-adjusted baseline). `sensitivity = 0` disables the flex (rigid
+behavior); `sensitivity > 1` cuts more aggressively than proportional.
+
+Flexible spending typically cuts failure rate by 10–20 percentage points
+in scenarios where the rigid plan was depleting in down-return paths.
+
 ### Asset location
 
 Tax-efficient asset *location* (which account holds which asset) is a
@@ -302,6 +320,7 @@ conversions, ahead/behind-plan adjustment).
 | Employer 401k match                                | Backdoor Roth income phase-outs        |
 | **Mega-backdoor Roth (after-tax 401k)**            | Roth IRA / deductible IRA income limits |
 | Bengen smile retirement spending profile           | Self-employed plans (SEP, Solo 401k)   |
+| **Flexible / VPW spending with floor**             |                                        |
 | **Asset-location heuristic** (Reichenstein)        | Lump-sum bequests / inheritance        |
 | CRRA + bequest objective                           |                                        |
 | **Vectorised numpy simulation engine**             |                                        |

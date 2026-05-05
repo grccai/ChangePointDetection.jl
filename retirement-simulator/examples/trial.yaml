@@ -40,6 +40,9 @@ spending:
   working_annual_real: 100000   # POST-TAX working-years living budget;
                                 # everything above (taxes + contribs + this)
                                 # flows to taxable savings.
+  flexible:                     # variable-percentage withdrawal in retirement
+    floor_real:   80000         # never spend less than this
+    sensitivity:  1.0           # 1.0 = full proportional cuts on drawdown
 
 initial_portfolio:
   taxable:

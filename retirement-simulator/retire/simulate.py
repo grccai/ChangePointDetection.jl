@@ -426,12 +426,38 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
     qual_div = yield_amt[:, 0]
     ord_div = yield_amt[:, 1] + yield_amt[:, 2]
 
-    # 2) Spending target (real, then nominal)
+    # 2) Spending target (real, then nominal). Per-path because flexible
+    # spending makes the target depend on each path's portfolio drawdown.
     retirement_age = (scn.profile.retirement_date - scn.profile.birthdate
                       ).days / 365.25
     years_into_retire = max(0, int(round(age - retirement_age)))
     factor = _spending_smile_factor(years_into_retire, scn.spending.smile)
-    real_target = scn.spending.annual_real * factor
+    base_real = scn.spending.annual_real * factor
+
+    # On the first retirement year of each path, freeze the per-path
+    # baseline real wealth used to compute the drawdown ratio.
+    if years_into_retire == 0:
+        # Use start-of-year (post-return) real wealth.
+        s.flex_baseline_wealth = s.total_value() / s.cumulative_inflation
+
+    if scn.spending.flexible is not None and years_into_retire >= 0:
+        flex = scn.spending.flexible
+        current_real = s.total_value() / s.cumulative_inflation
+        # ratio relative to retirement-start real wealth; safe-divide.
+        baseline = np.where(s.flex_baseline_wealth > 0,
+                             s.flex_baseline_wealth, 1.0)
+        ratio = current_real / baseline
+        # Downside-only proportional scaling, then clamp to [floor/base, 1].
+        scaling = np.minimum(1.0, 1.0 + flex.sensitivity * (ratio - 1.0))
+        floor_scaling = (flex.floor_real / base_real
+                         if base_real > 0 else 0.0)
+        scaling = np.maximum(scaling, floor_scaling)
+        real_target = base_real * scaling
+        # Hard floor as belt-and-suspenders (in case base_real == 0).
+        real_target = np.maximum(real_target, flex.floor_real)
+    else:
+        real_target = np.full(P, base_real)
+
     s.real_target_spend[:, year_idx] = real_target
     nominal_target = real_target * s.cumulative_inflation
 

@@ -90,20 +90,48 @@ class SocialSecurity:
 
 
 @dataclass
+class FlexibleSpending:
+    """Flexible / variable-percentage withdrawal during retirement.
+
+    Spending each year is the smile-adjusted baseline scaled toward `floor_real`
+    when the portfolio is below its retirement-start trajectory:
+
+        ratio = current_real_wealth / wealth_at_retirement_start
+        scaling = clamp(1 + sensitivity * (ratio - 1), floor/base, 1)
+        spend  = max(floor_real, base_real * smile_factor * scaling)
+
+    With `sensitivity=1.0` (default) the cut is fully proportional to the
+    drawdown from retirement-start wealth: a 25% drop in real wealth
+    triggers a 25% spending cut, capped at `floor_real`. With
+    `sensitivity=0.0`, spending is fixed (no flex). Values >1 are more
+    aggressive cuts; values <1 are gentler.
+
+    No upside: spending is never raised above the smile-adjusted baseline.
+    (Easy to extend to a ceiling if wanted.)
+    """
+    floor_real: float
+    sensitivity: float = 1.0
+
+
+@dataclass
 class Spending:
     """Retirement spending target. `annual_real` is in today's dollars and is
     interpreted as POST-TAX consumption that the simulator must deliver each
     year, grossing-up withdrawals to cover the tax bill.
 
     `working_annual_real` (optional) is the working-years post-tax living
-    budget, also in today's dollars. If set, it overrides the savings-rate
-    residual: each working year, anything above (taxes + contributions +
-    `working_annual_real`) flows to taxable savings. If unset, the simulator
-    falls back to `(1 - savings.rate) * gross_wages` as the implied living
-    budget."""
+    budget. If set, it overrides the savings-rate residual: each working
+    year, anything above (taxes + contributions + `working_annual_real`)
+    flows to taxable savings. Otherwise the simulator falls back to
+    `(1 - savings.rate) * gross_wages` as the implied living budget.
+
+    `flexible` (optional) enables variable-percentage withdrawal — see
+    `FlexibleSpending`. When omitted, retirement spend is the smile-adjusted
+    baseline regardless of portfolio state."""
     annual_real: float
     smile: Literal["flat", "bengen"] = "flat"
     working_annual_real: float | None = None
+    flexible: FlexibleSpending | None = None
 
 
 @dataclass
@@ -318,7 +346,11 @@ def load_scenario(path: str | Path) -> Scenario:
     contribs = Contributions(**sav_raw.get("contributions", {}))
     savings = Savings(rate=float(sav_raw["rate"]), contributions=contribs)
 
-    spending = Spending(**raw["spending"])
+    spending_raw = dict(raw["spending"])
+    flex_raw = spending_raw.pop("flexible", None)
+    spending = Spending(**spending_raw)
+    if flex_raw:
+        spending.flexible = FlexibleSpending(**flex_raw)
 
     portfolio = _make_portfolio(raw["initial_portfolio"])
     targets_raw = raw["target_allocations"]

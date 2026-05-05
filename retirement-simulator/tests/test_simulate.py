@@ -209,6 +209,55 @@ def test_5y_clock_mature_conversion_no_penalty():
     assert (pen == 0).all()
 
 
+def test_flexible_spending_floor_enforced():
+    """When portfolio crashes, spending should be cut but not below floor."""
+    from retire.config import FlexibleSpending
+    scn = _basic_scenario(spending=80_000, n_paths=200)
+    scn.spending.flexible = FlexibleSpending(floor_real=40_000, sensitivity=1.0)
+    # Crank up volatility so the drawdown distribution sweeps the floor.
+    scn.market.stocks.vol = 0.40
+    r = simulate(scn)
+    # Across all paths and retirement years, target spend must be >= floor.
+    for p in r.paths:
+        # Retirement year window starts at year 15 in the basic scenario
+        # (age 40 birthdate-anchored, retirement_date=2041, end 2066 -> H=40).
+        ret_yrs = p.real_spending_by_year[15:]
+        assert (ret_yrs >= 40_000 - 1e-3).all() or (ret_yrs == 0).all(), \
+            f"floor breach: min={ret_yrs.min()}"
+        # And target must be <= base (downside-only)
+        assert (ret_yrs <= 80_000 + 1e-3).all()
+
+
+def test_flexible_spending_scales_proportionally():
+    """When ratio < 1, target = base * ratio (within floor)."""
+    from retire.config import FlexibleSpending
+    scn = _basic_scenario(spending=100_000, n_paths=50)
+    scn.spending.flexible = FlexibleSpending(floor_real=50_000, sensitivity=1.0)
+    # Force a market crash by setting low real returns
+    scn.market.stocks.real_return = -0.05
+    scn.market.bonds.real_return = -0.02
+    scn.market.stocks.vol = 1e-9
+    scn.market.bonds.vol = 1e-9
+    scn.market.cash.vol = 1e-9
+    r = simulate(scn)
+    p = r.paths[0]
+    # By year 5+ of retirement, portfolio is way down -> spending should be
+    # below baseline ($100k) and approaching floor ($50k).
+    late_target = p.real_spending_by_year[20]  # year 5 of retirement
+    assert late_target < 100_000
+    assert late_target >= 50_000
+
+
+def test_no_flexible_spending_unchanged():
+    """When .flexible is None, spending equals smile-adjusted baseline."""
+    scn = _basic_scenario(spending=100_000, n_paths=100)
+    scn.spending.flexible = None
+    r = simulate(scn)
+    # Retirement first year (age 55, year 15) target = $100k flat smile
+    for p in r.paths:
+        assert math.isclose(p.real_spending_by_year[15], 100_000, rel_tol=1e-9)
+
+
 def test_glide_policy_degenerates_to_static():
     """Glide policy with both knots equal == static policy: simulating with
     each gives identical real wealth at every year."""

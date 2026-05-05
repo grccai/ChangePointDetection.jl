@@ -59,6 +59,11 @@ class VState:
     nominal_income: np.ndarray         # (P,) — wages this year (nominal)
     cumulative_inflation: np.ndarray   # (P,) — multiplier from year 0 (real -> nominal)
     failed: np.ndarray                 # (P,) bool
+    # Flexible spending: the per-path real wealth at the start of retirement.
+    # Set lazily by the simulator on the first decumulation year of each path;
+    # zeros until then. Used to compute the drawdown ratio that scales
+    # current-year spending toward the configured floor.
+    flex_baseline_wealth: np.ndarray   # (P,)
 
     # Outputs (filled across simulation)
     real_wealth: np.ndarray         # (P, H + 1)
@@ -84,6 +89,7 @@ class VState:
             nominal_income=np.full(n_paths, float(starting_nominal_income)),
             cumulative_inflation=np.ones(n_paths),
             failed=np.zeros(n_paths, dtype=bool),
+            flex_baseline_wealth=np.zeros(n_paths),
             real_wealth=np.zeros((n_paths, horizon + 1)),
             real_taxes=np.zeros((n_paths, horizon)),
             real_target_spend=np.zeros((n_paths, horizon)),
