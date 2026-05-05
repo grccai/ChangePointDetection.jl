@@ -64,6 +64,17 @@ class OptimizerConfig:
     #            conversion brackets + Trad/Roth split + wealth_responsiveness.
     #            Each year's decision depends on age and FIRE progress.
     policy_class: str = "static"
+    # Objective family:
+    #   'utility'   : maximize CRRA utility of consumption + bequest, with a
+    #                 plan-failure penalty. (default)
+    #   'fire_prob' : maximize P(real wealth at `fire_age` >= `fire_target_real`)
+    #                 subject to P(ruin over full horizon) <= `ruin_max`. The
+    #                 ruin constraint is a steep penalty (effectively hard).
+    objective: str = "utility"
+    # fire_prob-specific knobs (None defaults are filled in by `optimize()`).
+    fire_target_real: float | None = None    # default: 25 * scn.spending.annual_real
+    fire_age: int | None = None              # default: scn.profile.retirement_age
+    ruin_max: float = 0.01                   # 1% by default for fire_prob
 
 
 def _alloc(s: float, b: float) -> Allocation:
@@ -170,7 +181,58 @@ class _Objective:
         return -expected_util + fail_pen
 
 
-def _objective_for(scn_base: Scenario, cfg: OptimizerConfig) -> _Objective:
+@dataclass
+class _FIREProbObjective:
+    """Chance-constrained: maximize P(real wealth at `fire_age` >= target)
+    subject to P(ruin) <= `ruin_max`. The constraint is enforced via a steep
+    quadratic+linear penalty that quickly dominates the objective when
+    violated, so DE searches the feasible interior."""
+    scn_base: Scenario
+    cfg: OptimizerConfig
+    fire_age: int
+    fire_target_real: float
+    ruin_max: float
+    year_idx_at_fire: int   # precomputed
+
+    def __call__(self, x: np.ndarray) -> float:
+        policy = _build_policy(x, self.scn_base, self.cfg)
+        scn = deepcopy(self.scn_base)
+        scn.simulation.n_paths = self.cfg.n_paths_inner
+        scn.simulation.seed = self.cfg.seed
+        result = simulate(scn, policy=policy)
+
+        wealth_fire = np.array([p.real_wealth_by_year[self.year_idx_at_fire]
+                                 for p in result.paths])
+        prob_hit = float((wealth_fire >= self.fire_target_real).mean())
+        ruin = result.failure_rate()
+
+        slack = ruin - self.ruin_max  # > 0 means infeasible
+        if slack <= 0:
+            penalty = 0.0
+        else:
+            # Linear + quadratic ramp; coefficients chosen so a 1pp violation
+            # ( slack=0.01 ) costs ~0.10 of P(hit), enough to dominate small
+            # gains in P(hit) at the constraint boundary.
+            penalty = 10.0 * slack + 5_000.0 * slack ** 2
+        return -prob_hit + penalty
+
+
+def _objective_for(scn_base: Scenario, cfg: OptimizerConfig):
+    if cfg.objective == "fire_prob":
+        fire_age = cfg.fire_age if cfg.fire_age is not None \
+            else int(round(scn_base.profile.retirement_age))
+        fire_target = cfg.fire_target_real if cfg.fire_target_real is not None \
+            else 25.0 * scn_base.spending.annual_real
+        # year_idx where age first reaches fire_age. Profile.age is age-at-start;
+        # year_idx_at_fire = round(fire_age - profile.age).
+        year_idx_at_fire = max(0, min(scn_base.profile.horizon(),
+                                       int(round(fire_age - scn_base.profile.age))))
+        return _FIREProbObjective(
+            scn_base=scn_base, cfg=cfg,
+            fire_age=fire_age, fire_target_real=fire_target,
+            ruin_max=cfg.ruin_max,
+            year_idx_at_fire=year_idx_at_fire,
+        )
     return _Objective(
         scn_base=scn_base, cfg=cfg,
         horizon=scn_base.profile.horizon(),

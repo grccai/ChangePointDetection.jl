@@ -82,12 +82,28 @@ def optimize_cmd(
              "(per-account 2-knot glide path + life-phase conversion brackets "
              "+ wealth-vs-target responsiveness, 16 vars).",
     ),
+    objective: str = typer.Option(
+        "utility",
+        help="'utility' (CRRA + bequest + failure penalty) or 'fire_prob' "
+             "(maximize P(wealth at --fire-age >= --fire-target) subject to "
+             "P(ruin) <= --ruin-max).",
+    ),
+    fire_age: int = typer.Option(50, help="FIRE target age (only for fire_prob)."),
+    fire_target: float = typer.Option(2_500_000, help="Real-dollar FIRE target "
+                                       "(only for fire_prob)."),
+    ruin_max: float = typer.Option(0.01, help="Maximum P(ruin) constraint "
+                                    "(only for fire_prob)."),
 ) -> None:
     """Optimize allocation and contribution split for the scenario."""
     scn = load_scenario(config)
     cfg = OptimizerConfig(gamma=gamma, n_paths_inner=paths, maxiter=maxiter,
                          popsize=popsize, workers=workers,
-                         location_mode=location_mode, policy_class=policy)
+                         location_mode=location_mode, policy_class=policy,
+                         objective=objective,
+                         fire_age=fire_age if objective == "fire_prob" else None,
+                         fire_target_real=fire_target if objective == "fire_prob"
+                                          else None,
+                         ruin_max=ruin_max)
     print("Running differential evolution... (this can take a few minutes)")
     allocations, conv_bracket, trad_split, diag = optimize(scn, cfg)
     print(f"\n=== Optimal decisions (policy={diag['policy_class']}) ===")
@@ -121,6 +137,25 @@ def optimize_cmd(
     scn.simulation.n_paths = final_paths
     result = simulate(scn, policy=diag["policy"])
     _print_summary(scn, result, "Final evaluation at optimum")
+
+    if objective == "fire_prob":
+        import numpy as np
+        # Recompute P(hit FIRE target) and feasibility at final_paths
+        start_age = scn.profile.age
+        year_idx_at_fire = max(0, min(scn.profile.horizon(),
+                                       int(round(fire_age - start_age))))
+        wealth_fire = np.array([p.real_wealth_by_year[year_idx_at_fire]
+                                 for p in result.paths])
+        prob_hit = float((wealth_fire >= fire_target).mean())
+        ruin = result.failure_rate()
+        feas = "FEASIBLE" if ruin <= ruin_max else "INFEASIBLE"
+        print(f"\n=== FIRE-prob objective ===")
+        print(f"  P(real wealth at age {fire_age} >= ${fire_target:,.0f}): {100*prob_hit:.2f}%")
+        print(f"  Wealth at age {fire_age} quantiles (real $):")
+        for q in [0.05, 0.25, 0.5, 0.75, 0.95]:
+            print(f"    {int(q*100):>3}th pct  ${np.quantile(wealth_fire, q):>14,.0f}")
+        print(f"  P(ruin) over full plan: {100*ruin:.2f}%   "
+              f"(constraint: <= {100*ruin_max:.2f}%)   --> {feas}")
 
 
 @app.command()
