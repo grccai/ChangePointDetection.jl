@@ -208,17 +208,18 @@ class GlidePolicy:
 # ---------- Factory: build a GlidePolicy from a flat parameter vector ----------
 
 GLIDE_PARAM_LAYOUT = """
-GlidePolicy parameter vector (length 16):
-  0..1   taxable.stock     (start_value, end_value)
-  2..3   taxable.bond      (start, end)
-  4..5   traditional.stock (start, end)
-  6..7   traditional.bond  (start, end)
-  8..9   roth.stock        (start, end)
-  10..11 roth.bond         (start, end)
-  12     conversion bracket index for FIRE-gap phase (snapped to discrete)
-  13     conversion bracket index for SS-window phase (snapped)
-  14     trad contribution split (0..1)
-  15     wealth_responsiveness (0..2 typically)
+GlidePolicy parameter vector (length 12). Cash is constrained to 0 in
+Traditional and Roth (it makes no sense to hold cash in a tax-advantaged
+account); their bond fractions are implicitly (1 - stock).
+
+  0..1   taxable.stock  (start_value, end_value)
+  2..3   taxable.bond   (start, end)               [cash = 1 - stock - bond]
+  4..5   traditional.stock (start, end)            [bond = 1 - stock, cash = 0]
+  6..7   roth.stock        (start, end)            [bond = 1 - stock, cash = 0]
+  8      conversion bracket index for FIRE-gap phase (snapped to discrete)
+  9      conversion bracket index for SS-window phase (snapped)
+  10     trad contribution split (0..1)
+  11     wealth_responsiveness (0..2 typically)
 """
 
 
@@ -235,23 +236,95 @@ def build_glide_policy(x: list[float] | tuple[float, ...],
                        start_age: float, end_age: float,
                        retirement_age: float, ss_age: float = 67.0,
                        rmd_age: float = 73.0) -> GlidePolicy:
-    """Decode a 16-element vector to a GlidePolicy. The (start_age, end_age)
-    knot positions are *fixed* by the scenario (passed here); only the
-    *values* at those knots are free."""
-    if len(x) != 16:
-        raise ValueError(f"expected 16 params for glide policy, got {len(x)}")
+    """Decode a 12-element vector to a GlidePolicy. Cash is forbidden in
+    Trad/Roth (their bond glides are derived as 1 - stock_glide); only the
+    taxable account has a free bond and (residual) cash glide."""
+    if len(x) != 12:
+        raise ValueError(f"expected 12 params for glide policy, got {len(x)}")
 
     def _glide(start_v: float, end_v: float) -> GlidePath:
         return GlidePath([(start_age, _clip(start_v)),
                           (end_age, _clip(end_v))])
 
+    # Trad/Roth: bond glide = 1 - stock glide (yields cash = 0 after _alloc).
+    def _bond_complement(stock_start: float, stock_end: float) -> GlidePath:
+        return GlidePath([(start_age, 1.0 - _clip(stock_start)),
+                          (end_age, 1.0 - _clip(stock_end))])
+
     return GlidePolicy(
         taxable=AccountGlide(stock=_glide(x[0], x[1]),
                              bond=_glide(x[2], x[3])),
         traditional=AccountGlide(stock=_glide(x[4], x[5]),
-                                 bond=_glide(x[6], x[7])),
-        roth=AccountGlide(stock=_glide(x[8], x[9]),
-                          bond=_glide(x[10], x[11])),
+                                 bond=_bond_complement(x[4], x[5])),
+        roth=AccountGlide(stock=_glide(x[6], x[7]),
+                          bond=_bond_complement(x[6], x[7])),
+        conv_during_fire_gap=_snap_bracket(x[8]),
+        conv_during_ss_window=_snap_bracket(x[9]),
+        trad_contribution_split=_clip(x[10]),
+        wealth_responsiveness=max(0.0, min(2.0, x[11])),
+        retirement_age=retirement_age,
+        ss_age=ss_age,
+        rmd_age=rmd_age,
+    )
+
+
+GLIDE_PARAM_BOUNDS: list[tuple[float, float]] = [
+    (0.0, 1.0), (0.0, 1.0),  # taxable stock start/end
+    (0.0, 1.0), (0.0, 1.0),  # taxable bond
+    (0.0, 1.0), (0.0, 1.0),  # traditional stock (bond = 1-stock)
+    (0.0, 1.0), (0.0, 1.0),  # roth stock (bond = 1-stock)
+    (0.0, 5.0),               # conv FIRE-gap idx
+    (0.0, 5.0),               # conv SS-window idx
+    (0.0, 1.0),               # trad split
+    (0.0, 2.0),               # wealth_responsiveness
+]
+
+
+# ---------- Three-knot glide policy ----------
+
+THREE_KNOT_GLIDE_PARAM_LAYOUT = """
+ThreeKnotGlidePolicy parameter vector (length 16). Knots at start_age,
+retirement_age, and end_of_plan_age — separates accumulation and
+decumulation slopes. Cash is again forbidden in Trad/Roth.
+
+  0..2    taxable.stock   (start, retire, end)
+  3..5    taxable.bond    (start, retire, end)        [cash = 1 - stock - bond]
+  6..8    traditional.stock (start, retire, end)      [bond = 1 - stock, cash = 0]
+  9..11   roth.stock        (start, retire, end)      [bond = 1 - stock, cash = 0]
+  12      conversion bracket idx for FIRE-gap phase
+  13      conversion bracket idx for SS-window phase
+  14      trad contribution split
+  15      wealth_responsiveness
+"""
+
+
+def build_three_knot_glide_policy(
+        x: list[float] | tuple[float, ...],
+        start_age: float, retirement_age: float, end_age: float,
+        ss_age: float = 67.0, rmd_age: float = 73.0) -> GlidePolicy:
+    """Decode a 16-element vector to a GlidePolicy with three knots
+    per glide (start, retirement, end). Cash is forbidden in Trad/Roth.
+    Lets accumulation and decumulation glide slopes differ."""
+    if len(x) != 16:
+        raise ValueError(f"expected 16 params for three-knot policy, got {len(x)}")
+
+    def _glide_3(s: float, m: float, e: float) -> GlidePath:
+        return GlidePath([(start_age, _clip(s)),
+                          (retirement_age, _clip(m)),
+                          (end_age, _clip(e))])
+
+    def _bond_complement(s: float, m: float, e: float) -> GlidePath:
+        return GlidePath([(start_age, 1.0 - _clip(s)),
+                          (retirement_age, 1.0 - _clip(m)),
+                          (end_age, 1.0 - _clip(e))])
+
+    return GlidePolicy(
+        taxable=AccountGlide(stock=_glide_3(x[0], x[1], x[2]),
+                             bond=_glide_3(x[3], x[4], x[5])),
+        traditional=AccountGlide(stock=_glide_3(x[6], x[7], x[8]),
+                                 bond=_bond_complement(x[6], x[7], x[8])),
+        roth=AccountGlide(stock=_glide_3(x[9], x[10], x[11]),
+                          bond=_bond_complement(x[9], x[10], x[11])),
         conv_during_fire_gap=_snap_bracket(x[12]),
         conv_during_ss_window=_snap_bracket(x[13]),
         trad_contribution_split=_clip(x[14]),
@@ -262,15 +335,13 @@ def build_glide_policy(x: list[float] | tuple[float, ...],
     )
 
 
-GLIDE_PARAM_BOUNDS: list[tuple[float, float]] = [
-    (0.0, 1.0), (0.0, 1.0),  # taxable stock start/end
-    (0.0, 1.0), (0.0, 1.0),  # taxable bond
-    (0.0, 1.0), (0.0, 1.0),  # traditional stock
-    (0.0, 1.0), (0.0, 1.0),  # traditional bond
-    (0.0, 1.0), (0.0, 1.0),  # roth stock
-    (0.0, 1.0), (0.0, 1.0),  # roth bond
-    (0.0, 5.0),               # conv FIRE-gap idx
-    (0.0, 5.0),               # conv SS-window idx
-    (0.0, 1.0),               # trad split
-    (0.0, 2.0),               # wealth_responsiveness
+THREE_KNOT_GLIDE_PARAM_BOUNDS: list[tuple[float, float]] = [
+    (0.0, 1.0), (0.0, 1.0), (0.0, 1.0),  # taxable stock (3 knots)
+    (0.0, 1.0), (0.0, 1.0), (0.0, 1.0),  # taxable bond
+    (0.0, 1.0), (0.0, 1.0), (0.0, 1.0),  # traditional stock
+    (0.0, 1.0), (0.0, 1.0), (0.0, 1.0),  # roth stock
+    (0.0, 5.0),                           # conv FIRE-gap
+    (0.0, 5.0),                           # conv SS-window
+    (0.0, 1.0),                           # trad split
+    (0.0, 2.0),                           # wealth_responsiveness
 ]

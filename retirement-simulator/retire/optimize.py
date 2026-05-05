@@ -39,7 +39,9 @@ from .config import (Scenario, Allocation, TargetAllocations,
                      WithdrawalPolicy)
 from .location import heuristic_target_allocations
 from .policy import (Policy, StaticPolicy, GlidePolicy,
-                     build_glide_policy, GLIDE_PARAM_BOUNDS)
+                     build_glide_policy, GLIDE_PARAM_BOUNDS,
+                     build_three_knot_glide_policy,
+                     THREE_KNOT_GLIDE_PARAM_BOUNDS)
 from .simulate import simulate, SimResult
 
 
@@ -59,10 +61,12 @@ class OptimizerConfig:
     # 'heuristic' : optimize 4 vars (overall stock/bond + conv + split);
     #               location is fixed by the tax-efficient heuristic
     location_mode: str = "free"
-    # 'static' : single fixed Decision applied every year (legacy).
-    # 'glide'  : 16 vars — per-account 2-knot glide path + life-phase
-    #            conversion brackets + Trad/Roth split + wealth_responsiveness.
-    #            Each year's decision depends on age and FIRE progress.
+    # 'static'           : single fixed Decision applied every year (legacy).
+    # 'glide'            : 12 vars — 2-knot per-account glide (start, end);
+    #                      cash forbidden in Trad/Roth.
+    # 'three_knot_glide' : 16 vars — 3-knot per-account glide (start,
+    #                      retirement, end); separates accumulation and
+    #                      decumulation slopes; cash forbidden in Trad/Roth.
     policy_class: str = "static"
     # Objective family:
     #   'utility'   : maximize CRRA utility of consumption + bequest, with a
@@ -135,15 +139,20 @@ def _build_policy(x: np.ndarray, scn_base: Scenario,
                   cfg: OptimizerConfig) -> Policy:
     """Decode `x` into a Policy according to cfg.policy_class /
     cfg.location_mode."""
+    start_age = scn_base.profile.age
+    end_age = scn_base.profile._age_on(scn_base.profile.end_of_plan_date)
+    retirement_age = scn_base.profile.retirement_age
+    ss_age = float(scn_base.social_security.claim_age)
     if cfg.policy_class == "glide":
-        start_age = scn_base.profile.age
-        end_age = scn_base.profile._age_on(scn_base.profile.end_of_plan_date)
-        retirement_age = scn_base.profile.retirement_age
-        ss_age = float(scn_base.social_security.claim_age)
         return build_glide_policy(list(x), start_age=start_age,
                                   end_age=end_age,
                                   retirement_age=retirement_age,
                                   ss_age=ss_age)
+    if cfg.policy_class == "three_knot_glide":
+        return build_three_knot_glide_policy(
+            list(x), start_age=start_age,
+            retirement_age=retirement_age,
+            end_age=end_age, ss_age=ss_age)
     # static
     if cfg.location_mode == "heuristic":
         allocations, conv_target, trad_split = _decode_heuristic(x, scn_base)
@@ -315,6 +324,8 @@ def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
     obj = _objective_for(scn, cfg)
     if cfg.policy_class == "glide":
         bounds = list(GLIDE_PARAM_BOUNDS)
+    elif cfg.policy_class == "three_knot_glide":
+        bounds = list(THREE_KNOT_GLIDE_PARAM_BOUNDS)
     elif cfg.location_mode == "heuristic":
         bounds = [
             (0.0, 1.0), (0.0, 1.0),  # overall stock, bond
@@ -336,8 +347,9 @@ def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
         init="sobol", updating="deferred" if cfg.workers != 1 else "immediate",
     )
     policy = _build_policy(res.x, scn, cfg)
-    if cfg.policy_class == "glide":
-        # For glide, "current-year" allocations are policy.decide() at age 0.
+    if cfg.policy_class in ("glide", "three_knot_glide"):
+        # For glide policies, "current-year" allocations come from
+        # policy.decide() at age 0.
         from .policy import StateSummary
         ss0 = StateSummary(
             age=scn.profile.age, year_idx=0,

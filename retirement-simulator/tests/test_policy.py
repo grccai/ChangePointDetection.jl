@@ -142,15 +142,15 @@ def test_glide_policy_wealth_responsiveness_de_risk_when_ahead():
 
 
 def test_build_glide_policy_decodes_vector():
+    # 12-element vector: cash forbidden in Trad/Roth (their bond glides are
+    # derived as 1 - stock_glide).
     x = [
         0.85, 0.40,   # taxable stock start, end
         0.05, 0.35,   # taxable bond
-        0.50, 0.30,   # trad stock
-        0.50, 0.70,   # trad bond
-        1.00, 0.60,   # roth stock
-        0.00, 0.40,   # roth bond
-        2.0,          # conv FIRE-gap idx (0.12)
-        4.0,          # conv SS-window idx (0.24)
+        0.50, 0.30,   # trad stock (bond = 1 - stock implicit)
+        1.00, 0.60,   # roth stock (bond = 1 - stock implicit)
+        2.0,          # conv FIRE-gap idx (-> 0.12)
+        4.0,          # conv SS-window idx (-> 0.24)
         0.6,          # trad split
         0.3,          # wealth responsiveness
     ]
@@ -161,7 +161,41 @@ def test_build_glide_policy_decodes_vector():
     assert p.conv_during_fire_gap == 0.12
     assert p.conv_during_ss_window == 0.24
     assert math.isclose(p.trad_contribution_split, 0.6)
+    # Cash-forbidden in trad/roth: bond knot at start_age = 1 - 0.50 = 0.50.
+    assert math.isclose(p.traditional.bond.at(35), 1.0 - 0.50, abs_tol=1e-9)
+    # And the resulting allocation has cash = 0.
+    a = p.traditional.allocation_at(35)
+    assert math.isclose(a.cash, 0.0, abs_tol=1e-9)
+    a_roth = p.roth.allocation_at(35)
+    assert math.isclose(a_roth.cash, 0.0, abs_tol=1e-9)
 
 
 def test_glide_param_bounds_length_matches_decoder():
-    assert len(GLIDE_PARAM_BOUNDS) == 16
+    assert len(GLIDE_PARAM_BOUNDS) == 12
+
+
+def test_three_knot_glide_decoder():
+    from retire.policy import (build_three_knot_glide_policy,
+                                THREE_KNOT_GLIDE_PARAM_BOUNDS)
+    x = [
+        0.85, 0.65, 0.30,   # taxable stock at start, retire, end
+        0.05, 0.20, 0.50,   # taxable bond
+        0.70, 0.40, 0.10,   # trad stock (bond = 1 - stock)
+        1.00, 0.80, 0.50,   # roth stock
+        2.0, 4.0,           # conv brackets (0.12, 0.24)
+        0.6, 0.3,           # trad split, wealth_responsiveness
+    ]
+    p = build_three_knot_glide_policy(
+        x, start_age=35.0, retirement_age=55.0, end_age=95.0)
+    # Three-knot interpolation; the middle knot lets accumulation and
+    # decumulation slopes differ.
+    assert math.isclose(p.taxable.stock.at(35), 0.85)
+    assert math.isclose(p.taxable.stock.at(55), 0.65)  # mid knot
+    assert math.isclose(p.taxable.stock.at(95), 0.30)
+    # Linear interp between mid knot (55, 0.65) and end (95, 0.30):
+    # at age 75 = halfway, value = 0.475
+    assert math.isclose(p.taxable.stock.at(75), 0.475, abs_tol=1e-9)
+    # Cash forbidden in Trad/Roth
+    assert math.isclose(p.traditional.allocation_at(55).cash, 0.0, abs_tol=1e-9)
+    assert math.isclose(p.roth.allocation_at(55).cash, 0.0, abs_tol=1e-9)
+    assert len(THREE_KNOT_GLIDE_PARAM_BOUNDS) == 16

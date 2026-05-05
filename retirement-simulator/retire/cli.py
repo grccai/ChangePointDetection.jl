@@ -78,9 +78,10 @@ def optimize_cmd(
     ),
     policy: str = typer.Option(
         "static",
-        help="'static' (single fixed Decision per year) or 'glide' "
-             "(per-account 2-knot glide path + life-phase conversion brackets "
-             "+ wealth-vs-target responsiveness, 16 vars).",
+        help="'static' (single fixed Decision per year) | 'glide' (2-knot "
+             "glide, 12 vars, no cash in Trad/Roth) | 'three_knot_glide' "
+             "(3-knot glide with mid-knot at retirement, 16 vars, no cash "
+             "in Trad/Roth).",
     ),
     objective: str = typer.Option(
         "utility",
@@ -119,16 +120,19 @@ def optimize_cmd(
           f"bond={allocations.roth.bond:.2%}  cash={allocations.roth.cash:.2%}")
     print(f"Year-0 Roth conversion bracket target: {conv_bracket}")
     print(f"401k contribution split (trad fraction): {trad_split:.2%}")
-    if diag["policy_class"] == "glide":
+    if diag["policy_class"] in ("glide", "three_knot_glide"):
         gp = diag["policy"]
         print()
-        print(f"Glide path (year-0 -> end-of-plan):")
+        print(f"Glide path knots ({len(gp.taxable.stock.knots)} knots per asset):")
         for name, ag in [("Taxable", gp.taxable), ("Traditional", gp.traditional),
                          ("Roth", gp.roth)]:
             sk = ag.stock.knots
             bk = ag.bond.knots
-            print(f"  {name:<12} stock {sk[0][1]:.2%} -> {sk[-1][1]:.2%}   "
-                  f"bond {bk[0][1]:.2%} -> {bk[-1][1]:.2%}")
+            stock_str = " -> ".join(f"{v:.2%}" for _, v in sk)
+            bond_str  = " -> ".join(f"{v:.2%}" for _, v in bk)
+            ages_str  = "/".join(f"{a:.0f}" for a, _ in sk)
+            print(f"  {name:<12} ages {ages_str:<14}   stock {stock_str}")
+            print(f"  {'':<12} {'':<19}   bond  {bond_str}")
         print(f"  conversion bracket FIRE-gap:  {gp.conv_during_fire_gap}")
         print(f"  conversion bracket SS-window: {gp.conv_during_ss_window}")
         print(f"  wealth_responsiveness: {gp.wealth_responsiveness:.3f} "
