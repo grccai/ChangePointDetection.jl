@@ -1,0 +1,91 @@
+# Example scenario: 35-year-old single filer, FIRE at 50, plan to age 95.
+# All dollar values are in TODAY'S dollars unless explicitly nominal.
+# Real returns are post-inflation; the inflation_mean below converts them
+# to nominal internally as needed.
+
+profile:
+  age: 35
+  retirement_age: 50
+  end_of_plan_age: 95
+  filing_status: single        # 'single' or 'mfj'
+  state_marginal_rate: 0.05    # flat state tax rate (set 0.0 for no-tax state)
+
+income:
+  current_gross: 200000
+  growth_rate: 0.03            # nominal (combine real growth + inflation)
+
+savings:
+  rate: 0.40                   # 40% of gross saved (after-tax living budget = 60% of gross less tax)
+  contributions:
+    trad_401k: max             # max out (uses IRS limit + catchup if 50+)
+    roth_401k: 0
+    trad_ira: 0
+    roth_ira: 7000             # backdoor implicit if income is high
+    employer_match_rate: 0.05  # 5% of gross matched into traditional 401k
+
+# Annual real spending in retirement (today's dollars). Inflation-adjusted
+# automatically.
+spending:
+  annual_real: 80000
+  smile: bengen                # 'flat' or 'bengen'
+
+initial_portfolio:
+  # Taxable: explicit lots so cost basis and holding-period are tracked.
+  taxable:
+    lots:
+      - {asset: stock, market_value: 150000, cost_basis: 90000, age_years: 3.0}
+      - {asset: stock, market_value:   5000, cost_basis:  5000, age_years: 0.4}  # ST
+      - {asset: bond,  market_value:  30000, cost_basis: 28000, age_years: 2.0}
+      - {asset: cash,  market_value:  20000, cost_basis: 20000, age_years: 5.0}
+  traditional:                 # 401k + IRA combined
+    stock: 250000
+    bond:   50000
+    cash:       0
+  roth:                        # Roth IRA + Roth 401k combined
+    stock:  80000
+    bond:       0
+    cash:       0
+    basis:  35000              # contributions to date (withdrawable any time)
+
+# Target allocations PER ACCOUNT (each row sums to 1).
+# Asset *location* matters: bonds in traditional, stocks in Roth/taxable
+# is the textbook tax-efficient default.
+target_allocations:
+  taxable:
+    stock: 0.85
+    bond: 0.05
+    cash: 0.10
+  traditional:
+    stock: 0.50
+    bond: 0.50
+    cash: 0.00
+  roth:
+    stock: 1.00
+    bond: 0.00
+    cash: 0.00
+
+# Real (post-inflation) expected returns. Volatilities are real annualized.
+# Defaults are conservative long-run estimates; tune to your priors.
+market:
+  stocks: {real_return: 0.06, vol: 0.18}
+  bonds:  {real_return: 0.02, vol: 0.06}
+  cash:   {real_return: 0.005, vol: 0.01}
+  inflation_mean: 0.025
+  inflation_vol: 0.0           # set >0 for stochastic inflation
+  correlation_stock_bond: 0.10
+  correlation_stock_cash: 0.0
+  correlation_bond_cash: 0.0
+
+social_security:
+  monthly_at_67: 2500          # nominal-today; COLA'd by inflation
+  claim_age: 67
+
+withdrawal:
+  strategy: tax_aware          # tax_aware | proportional | ordered
+  roth_conversion_target_bracket: 0.12
+  aca_magi_cap: 50000          # null disables ACA cliff awareness
+
+simulation:
+  n_paths: 5000
+  seed: 42
+  return_model: gbm
