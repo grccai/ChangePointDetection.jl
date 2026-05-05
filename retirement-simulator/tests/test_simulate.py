@@ -209,6 +209,74 @@ def test_5y_clock_mature_conversion_no_penalty():
     assert (pen == 0).all()
 
 
+def test_glide_policy_degenerates_to_static():
+    """Glide policy with both knots equal == static policy: simulating with
+    each gives identical real wealth at every year."""
+    from retire.policy import (StaticPolicy, GlidePolicy, GlidePath,
+                                AccountGlide)
+    static_alloc = TargetAllocations(
+        taxable=Allocation(0.7, 0.2, 0.1),
+        traditional=Allocation(0.4, 0.6, 0.0),
+        roth=Allocation(1.0, 0.0, 0.0),
+    )
+    static_pol = StaticPolicy(allocations=static_alloc,
+                              conversion_bracket=None,
+                              trad_contribution_split=1.0)
+    flat = lambda v: GlidePath([(0.0, v), (200.0, v)])
+    glide_pol = GlidePolicy(
+        taxable=AccountGlide(flat(0.7), flat(0.2)),
+        traditional=AccountGlide(flat(0.4), flat(0.6)),
+        roth=AccountGlide(flat(1.0), flat(0.0)),
+        conv_during_fire_gap=None, conv_during_ss_window=None,
+        trad_contribution_split=1.0, wealth_responsiveness=0.0,
+        retirement_age=55.0, ss_age=67.0, rmd_age=73.0,
+    )
+    scn = _basic_scenario(spending=40_000)
+    r_static = simulate(scn, policy=static_pol)
+    r_glide = simulate(scn, policy=glide_pol)
+    # Identical seed -> identical paths
+    for ps, pg in zip(r_static.paths, r_glide.paths):
+        assert np.allclose(ps.real_wealth_by_year, pg.real_wealth_by_year,
+                           rtol=1e-9, atol=1e-3)
+
+
+def test_glide_policy_changes_outcome_when_knots_differ():
+    """Glide path that de-risks aggressively into retirement should give
+    different outcomes from a flat 100% stock policy."""
+    from retire.policy import GlidePolicy, GlidePath, AccountGlide
+    flat_stock = lambda: AccountGlide(
+        GlidePath([(0.0, 1.0), (200.0, 1.0)]),
+        GlidePath([(0.0, 0.0), (200.0, 0.0)]),
+    )
+    aggressive = GlidePolicy(
+        taxable=flat_stock(), traditional=flat_stock(), roth=flat_stock(),
+        conv_during_fire_gap=None, conv_during_ss_window=None,
+        retirement_age=55.0,
+    )
+    conservative = GlidePolicy(
+        taxable=AccountGlide(
+            GlidePath([(40.0, 1.0), (80.0, 0.2)]),  # de-risk to 20% stock
+            GlidePath([(40.0, 0.0), (80.0, 0.7)])),
+        traditional=AccountGlide(
+            GlidePath([(40.0, 1.0), (80.0, 0.2)]),
+            GlidePath([(40.0, 0.0), (80.0, 0.7)])),
+        roth=AccountGlide(
+            GlidePath([(40.0, 1.0), (80.0, 0.2)]),
+            GlidePath([(40.0, 0.0), (80.0, 0.7)])),
+        conv_during_fire_gap=None, conv_during_ss_window=None,
+        retirement_age=55.0,
+    )
+    scn = _basic_scenario(spending=40_000, n_paths=200)
+    r_agg = simulate(scn, policy=aggressive)
+    r_con = simulate(scn, policy=conservative)
+    # Median terminal wealth should differ; we don't assert direction since
+    # both can be optimal in different return regimes — just that the policy
+    # actually changed something.
+    q_agg = r_agg.terminal_quantiles([0.5])[0.5]
+    q_con = r_con.terminal_quantiles([0.5])[0.5]
+    assert q_agg != q_con
+
+
 def test_withdraw_roth_basis_first_no_penalty():
     from retire.vstate import withdraw_roth
     s = VState.from_portfolio(_basic_scenario().initial_portfolio,

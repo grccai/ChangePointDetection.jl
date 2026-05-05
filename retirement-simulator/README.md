@@ -52,15 +52,32 @@ The simulation is **vectorised over Monte Carlo paths** with numpy: 5000
 paths × 60 years runs in a couple of seconds (>3000 paths/sec on a single
 core; ~180× faster than the original scalar engine).
 
-It then **optimizes** allocations across the three accounts plus the
-Traditional/Roth contribution split and Roth conversion target bracket using
-differential evolution against an expected-utility objective with a CRRA
-preference and a plan-failure penalty. Two location modes:
-* `free` (8 vars): jointly optimize allocation and location.
-* `heuristic` (4 vars): optimize overall (stock, bond, cash) and let the
-  Reichenstein-style location heuristic place each asset (bonds in
-  Traditional, stocks in Roth, cash in Taxable). Faster convergence,
-  smaller decision space.
+It then **optimizes** decisions using differential evolution against an
+expected-utility objective with a CRRA preference and a plan-failure
+penalty. Two policy classes (orthogonal to two location modes):
+
+* **`static` policy** — single fixed Decision applied every year (legacy).
+  * `--location-mode free` (8 vars): jointly optimize allocation and location.
+  * `--location-mode heuristic` (4 vars): optimize overall (stock, bond,
+    cash) and let the Reichenstein heuristic place each asset.
+
+* **`glide` policy** — present-year decisions optimized *under the
+  assumption that future-year decisions will also be optimal*. Each year
+  the simulator queries the policy with the current age, year-index, and
+  cross-path median real wealth (vs the FIRE target). The policy returns:
+  * Per-account allocation from a 2-knot piecewise-linear **glide path**
+    over age — captures the textbook "100 minus age" risk-down effect,
+    expressively per-account.
+  * **Life-phase Roth conversion bracket**: zero while wages exist, one
+    bracket target between FIRE and Social Security claim age, another
+    between SS-claim and RMDs, zero post-RMD.
+  * Working-year **Trad/Roth contribution split** (single value).
+  * **Wealth-responsiveness** term: shifts the year's stock fraction by
+    `−w · (median_real_wealth / FIRE_target − 1)`, so the policy de-risks
+    when the simulation is ahead of plan and risks up when behind.
+  Total: 16 parameters. Strictly more expressive than `static` (a glide
+  with equal start/end knots and zero responsiveness reproduces a static
+  policy exactly — see `tests/test_simulate.py::test_glide_policy_degenerates_to_static`).
 
 ## Install
 
@@ -115,11 +132,15 @@ retire validate examples/example.yaml
 # Monte Carlo the configured allocation
 retire simulate-cmd examples/example.yaml --paths-csv out.csv
 
-# Optimize allocation + contribution split + conversion bracket
+# Optimize a static (single-Decision-for-all-years) policy
 retire optimize-cmd examples/example.yaml --paths 1500 --maxiter 30
 
-# Optimize using the tax-efficient asset-location heuristic (4 vars instead
-# of 8, faster convergence)
+# Optimize a glide-path policy whose decisions depend on age and on
+# how the portfolio compares to the FIRE target each year (16 vars)
+retire optimize-cmd examples/example.yaml --policy glide --paths 1500 --maxiter 30
+
+# Optimize using the tax-efficient asset-location heuristic (static, 4 vars,
+# faster convergence)
 retire optimize-cmd examples/example.yaml --location-mode heuristic
 
 # Compute the tax-efficient asset-location placement for a given overall
@@ -222,7 +243,17 @@ Decumulation:
 
 ### Optimizer
 
-Decision variables:
+The objective (minimized as the negative) is
+
+  J = −E\[ Σ<sub>t=T<sub>ret</sub></sub><sup>T</sup> β<sup>t−T<sub>ret</sub></sup> · u(c<sub>t</sub>) + w<sub>bequest</sub> · u(W<sub>T</sub>) ] + λ · P(failure)
+
+with CRRA utility u(c) = c<sup>1−γ</sup> / (1−γ) (γ ≠ 1) or log(c) (γ = 1).
+Default γ = 3 (moderately risk-averse). Optimization uses
+`scipy.optimize.differential_evolution` with Sobol initialization. Inner MC
+is small (default 1500 paths) to keep evaluations fast; the final reported
+allocation is re-evaluated at 5000 paths.
+
+**Static-policy decision variables** (8):
 
 | index | meaning                                          |
 |-------|--------------------------------------------------|
@@ -232,15 +263,24 @@ Decision variables:
 | 6     | Roth conversion bracket target (snapped to {None, 10%, 12%, 22%, 24%, 32%}) |
 | 7     | 401k contribution split (fraction Traditional vs Roth) |
 
-Objective (minimized as the negative):
+**Glide-policy decision variables** (16):
 
-  J = −E\[ Σ<sub>t=T<sub>ret</sub></sub><sup>T</sup> β<sup>t−T<sub>ret</sub></sup> · u(c<sub>t</sub>) + w<sub>bequest</sub> · u(W<sub>T</sub>) ] + λ · P(failure)
+| index   | meaning                                                          |
+|---------|------------------------------------------------------------------|
+| 0–11    | three accounts × (stock_start, stock_end, bond_start, bond_end)  |
+| 12      | Roth conversion bracket idx during FIRE-to-SS gap (snapped)      |
+| 13      | Roth conversion bracket idx during SS-to-RMD window (snapped)    |
+| 14      | working-year Trad/Roth contribution split                        |
+| 15      | wealth-vs-target responsiveness (de-risk when ahead, risk up when behind) |
 
-with CRRA utility u(c) = c<sup>1−γ</sup> / (1−γ) (γ ≠ 1) or log(c) (γ = 1).
-Default γ = 3 (moderately risk-averse). Optimization uses
-`scipy.optimize.differential_evolution` with Sobol initialization. Inner MC is
-small (default 1500 paths) to keep evaluations fast; the final reported
-allocation is re-evaluated at 5000 paths.
+The glide policy makes the optimization sequential in spirit: each year's
+decision depends on the current age and the simulation's running progress
+toward the FIRE target. We optimize today's parameters under the
+assumption that future years' decisions will be made by the same
+(optimized) policy applied to future states. This is a *parametric
+policy* — not literally Bellman-optimal, but the policy class is rich
+enough to capture the levers that matter (glide paths, life-phase
+conversions, ahead/behind-plan adjustment).
 
 ## What is and isn't modelled
 
@@ -344,17 +384,19 @@ retirement-simulator/
 ├── retire/
 │   ├── accounts.py           # Lot, TaxableAccount, TaxAdvantagedAccount, Portfolio
 │   ├── cli.py                # Typer CLI entrypoint
-│   ├── config.py             # YAML parsing, dataclass schema
+│   ├── config.py             # YAML parsing, dataclass schema (date-based)
 │   ├── location.py           # tax-efficient asset-location heuristic
-│   ├── optimize.py           # differential evolution allocation optimizer
+│   ├── optimize.py           # differential evolution policy optimizer
+│   ├── policy.py             # StaticPolicy, GlidePolicy (time/state-aware)
 │   ├── returns.py            # GBM + bootstrap return models
 │   ├── simulate.py           # vectorised year-by-year simulation engine
-│   ├── state_taxes.py        # CA / OR / WA brackets, multi-state timeline
+│   ├── state_taxes.py        # CA / OR / WA brackets, date-based timeline
 │   ├── taxes.py              # 2024 federal tax math + RMD divisors
 │   └── vstate.py             # batched numpy state for the vectorised engine
 └── tests/
     ├── test_accounts.py
     ├── test_location.py
+    ├── test_policy.py        # StaticPolicy / GlidePolicy invariants
     ├── test_returns.py
     ├── test_simulate.py      # integration tests on the vector engine
     ├── test_state_taxes.py

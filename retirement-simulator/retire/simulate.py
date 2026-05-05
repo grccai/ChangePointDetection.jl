@@ -18,6 +18,7 @@ import numpy as np
 from .accounts import Asset
 from .config import (Scenario, Allocation, TargetAllocations,
                      WithdrawalPolicy, Spending)
+from .policy import (Policy, StaticPolicy, Decision, StateSummary)
 from .returns import sample_gbm_paths, sample_inflation
 from .state_taxes import (StateTimeline, state_tax_vec, state_wages_tax,
                           state_residency_tax_vec)
@@ -174,13 +175,33 @@ def _resolve_contrib_value(value: float | str, limit: float) -> float:
 
 def simulate(scn: Scenario,
              allocations: TargetAllocations | None = None,
+             policy: Policy | None = None,
              ) -> SimResult:
-    """Run a vectorised Monte Carlo. Returns the same SimResult interface as
-    the scalar version (so callers and tests don't change)."""
-    if allocations is not None:
-        from copy import deepcopy
-        scn = deepcopy(scn)
-        scn.target_allocations = allocations
+    """Run a vectorised Monte Carlo. Returns SimResult.
+
+    Decision policy resolution (in order of precedence):
+      * `policy` argument (e.g., a GlidePolicy): the simulator queries
+        `policy.decide(StateSummary)` each year.
+      * `allocations` argument: builds a StaticPolicy that uses these
+        allocations + the scenario's withdrawal/conversion settings.
+      * Default: builds a StaticPolicy from scn.target_allocations and
+        scn.withdrawal.roth_conversion_target_bracket.
+    """
+    if policy is None:
+        if allocations is None:
+            allocations = scn.target_allocations
+        # Derive trad split from contributions (if both numeric)
+        c = scn.savings.contributions
+        try:
+            pool = float(c.trad_401k) + float(c.roth_401k)
+            split = float(c.trad_401k) / pool if pool > 0 else 1.0
+        except (TypeError, ValueError):
+            split = 1.0
+        policy = StaticPolicy(
+            allocations=allocations,
+            conversion_bracket=scn.withdrawal.roth_conversion_target_bracket,
+            trad_contribution_split=split,
+        )
 
     horizon = scn.profile.horizon()
     P = scn.simulation.n_paths
@@ -189,21 +210,14 @@ def simulate(scn: Scenario,
 
     returns_by_asset = sample_gbm_paths(market, horizon, P, seed=seed)
     inflation = sample_inflation(market, horizon, P, seed=(seed or 0) + 1)
-    # Stack into (P, H, 3) for per-asset access by index
     R = np.stack([returns_by_asset[Asset.STOCK],
                   returns_by_asset[Asset.BOND],
-                  returns_by_asset[Asset.CASH]], axis=-1)  # (P, H, 3)
+                  returns_by_asset[Asset.CASH]], axis=-1)
 
-    # Starting nominal income = total wages in the first simulation year.
     starting_wages = scn.state_taxes.total_wages(scn.profile.start_date, 0)
     s = VState.from_portfolio(scn.initial_portfolio, P, horizon,
                               starting_nominal_income=starting_wages)
 
-    targets_taxable = _alloc_to_array(scn.target_allocations.taxable)
-    targets_trad = _alloc_to_array(scn.target_allocations.traditional)
-    targets_roth = _alloc_to_array(scn.target_allocations.roth)
-
-    # Yield fractions per asset (taxable account)
     yf = np.array([market.yield_fraction[a] for a in ASSET_ORDER])
 
     fs = scn.profile.filing_status
@@ -211,19 +225,41 @@ def simulate(scn: Scenario,
     sim_start = scn.profile.start_date
     retirement_age = (scn.profile.retirement_date - scn.profile.birthdate
                       ).days / 365.25
+    fire_target_real = 25.0 * scn.spending.annual_real  # 4% rule benchmark
 
     for y in range(horizon):
         age = scn.profile.age_at_year(y)
-        ret_y = R[:, y, :]   # (P, 3)
-        infl_y = inflation[:, y]  # (P,)
+        ret_y = R[:, y, :]
+        infl_y = inflation[:, y]
         s.cumulative_inflation *= (1.0 + infl_y)
+
+        # ---- query policy with current state summary ----
+        if y == 0:
+            median_real_w = float(s.real_wealth[:, 0].mean())
+        else:
+            median_real_w = float(np.median(s.real_wealth[:, y]))
+        progress = (median_real_w / fire_target_real
+                    if fire_target_real > 0 else 1.0)
+        ss = StateSummary(
+            age=age, year_idx=y,
+            years_to_retirement=max(0.0, retirement_age - age),
+            fire_target_real=fire_target_real,
+            median_real_wealth=median_real_w,
+            fire_progress_ratio=progress,
+        )
+        decision = policy.decide(ss)
+        targets_taxable = _alloc_to_array(decision.allocations.taxable)
+        targets_trad = _alloc_to_array(decision.allocations.traditional)
+        targets_roth = _alloc_to_array(decision.allocations.roth)
 
         if age < retirement_age:
             _step_accumulation(s, scn, age, y, ret_y, fs, timeline,
-                               targets_taxable, targets_trad, targets_roth, yf)
+                               targets_taxable, targets_trad, targets_roth, yf,
+                               decision)
         else:
             _step_decumulation(s, scn, age, y, ret_y, fs, timeline,
-                               targets_taxable, targets_trad, targets_roth, yf)
+                               targets_taxable, targets_trad, targets_roth, yf,
+                               decision)
         s.age_st_to_lt()
         s.real_wealth[:, y + 1] = s.total_value() / s.cumulative_inflation
         if age >= retirement_age:
@@ -249,7 +285,8 @@ def _step_accumulation(s: VState, scn: Scenario, age: float, year_idx: int,
                        returns_y: np.ndarray, fs: FilingStatus,
                        timeline: StateTimeline,
                        tgt_tax: np.ndarray, tgt_trad: np.ndarray,
-                       tgt_roth: np.ndarray, yf: np.ndarray) -> None:
+                       tgt_roth: np.ndarray, yf: np.ndarray,
+                       decision: Decision) -> None:
     """Vectorised accumulation year, in-place mutation of s."""
     sim_start = scn.profile.start_date
     P = s.n_paths
@@ -283,11 +320,21 @@ def _step_accumulation(s: VState, scn: Scenario, age: float, year_idx: int,
     total_415c = 69_000.0 + catchup_401k
 
     c = scn.savings.contributions
-    trad_401k = min(_resolve_contrib_value(c.trad_401k, limit_401k), limit_401k,
-                    total_wages)
-    roth_401k_room = max(0.0, limit_401k - trad_401k)
-    roth_401k = min(_resolve_contrib_value(c.roth_401k, roth_401k_room),
-                    roth_401k_room)
+    # Pool the 401k contribution and split per the policy. If the user wrote
+    # numeric trad_401k + roth_401k, their sum is the pool; if either is
+    # 'max', we cap at the limit. The policy's split (0..1) determines the
+    # Traditional fraction.
+    try:
+        configured_pool = min(float(c.trad_401k) + float(c.roth_401k),
+                              limit_401k, total_wages)
+    except (TypeError, ValueError):
+        configured_pool = min(_resolve_contrib_value(c.trad_401k, limit_401k)
+                              + _resolve_contrib_value(c.roth_401k,
+                                                       limit_401k),
+                              limit_401k, total_wages)
+    pool_401k = max(0.0, configured_pool)
+    trad_401k = pool_401k * decision.trad_contribution_split
+    roth_401k = pool_401k - trad_401k
     trad_ira = min(_resolve_contrib_value(c.trad_ira, limit_ira), limit_ira)
     roth_ira = min(_resolve_contrib_value(c.roth_ira, limit_ira - trad_ira),
                    limit_ira - trad_ira)
@@ -354,7 +401,8 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
                        returns_y: np.ndarray, fs: FilingStatus,
                        timeline: StateTimeline,
                        tgt_tax: np.ndarray, tgt_trad: np.ndarray,
-                       tgt_roth: np.ndarray, yf: np.ndarray) -> None:
+                       tgt_roth: np.ndarray, yf: np.ndarray,
+                       decision: Decision) -> None:
     """Vectorised decumulation year, in-place mutation of s."""
     P = s.n_paths
     sim_start = scn.profile.start_date
@@ -399,10 +447,13 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
     ord_income = ord_div + rmd_taken
     ltcg_income = qual_div
 
-    # 5) Roth conversion ladder
+    # 5) Roth conversion ladder. Bracket target comes from the policy
+    # (which may be life-phase conditional), with the ACA cap from
+    # withdrawal config.
     wd = scn.withdrawal
-    if wd.roth_conversion_target_bracket is not None:
-        target_ord_taxable = top_of_bracket(wd.roth_conversion_target_bracket, fs)
+    conv_bracket = decision.conversion_bracket
+    if conv_bracket is not None:
+        target_ord_taxable = top_of_bracket(conv_bracket, fs)
         target_gross = target_ord_taxable + TAX_2024.std_deduction[fs]
         room = np.maximum(0.0, target_gross
                           - (ord_income + ss_nominal * 0.85))

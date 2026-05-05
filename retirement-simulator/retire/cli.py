@@ -74,33 +74,52 @@ def optimize_cmd(
     location_mode: str = typer.Option(
         "free",
         help="'free' (8 vars) or 'heuristic' (4 vars, location fixed by tax-"
-             "efficient placement).",
+             "efficient placement). Ignored when --policy=glide.",
+    ),
+    policy: str = typer.Option(
+        "static",
+        help="'static' (single fixed Decision per year) or 'glide' "
+             "(per-account 2-knot glide path + life-phase conversion brackets "
+             "+ wealth-vs-target responsiveness, 16 vars).",
     ),
 ) -> None:
     """Optimize allocation and contribution split for the scenario."""
     scn = load_scenario(config)
     cfg = OptimizerConfig(gamma=gamma, n_paths_inner=paths, maxiter=maxiter,
                          popsize=popsize, workers=workers,
-                         location_mode=location_mode)
+                         location_mode=location_mode, policy_class=policy)
     print("Running differential evolution... (this can take a few minutes)")
     allocations, conv_bracket, trad_split, diag = optimize(scn, cfg)
-    print("\n=== Optimal allocations ===")
-    print(f"Taxable     stock={allocations.taxable.stock:.2%}  "
+    print(f"\n=== Optimal decisions (policy={diag['policy_class']}) ===")
+    print(f"Year-0 allocation:")
+    print(f"  Taxable     stock={allocations.taxable.stock:.2%}  "
           f"bond={allocations.taxable.bond:.2%}  cash={allocations.taxable.cash:.2%}")
-    print(f"Traditional stock={allocations.traditional.stock:.2%}  "
+    print(f"  Traditional stock={allocations.traditional.stock:.2%}  "
           f"bond={allocations.traditional.bond:.2%}  cash={allocations.traditional.cash:.2%}")
-    print(f"Roth        stock={allocations.roth.stock:.2%}  "
+    print(f"  Roth        stock={allocations.roth.stock:.2%}  "
           f"bond={allocations.roth.bond:.2%}  cash={allocations.roth.cash:.2%}")
-    print(f"Roth conversion bracket target: {conv_bracket}")
+    print(f"Year-0 Roth conversion bracket target: {conv_bracket}")
     print(f"401k contribution split (trad fraction): {trad_split:.2%}")
+    if diag["policy_class"] == "glide":
+        gp = diag["policy"]
+        print()
+        print(f"Glide path (year-0 -> end-of-plan):")
+        for name, ag in [("Taxable", gp.taxable), ("Traditional", gp.traditional),
+                         ("Roth", gp.roth)]:
+            sk = ag.stock.knots
+            bk = ag.bond.knots
+            print(f"  {name:<12} stock {sk[0][1]:.2%} -> {sk[-1][1]:.2%}   "
+                  f"bond {bk[0][1]:.2%} -> {bk[-1][1]:.2%}")
+        print(f"  conversion bracket FIRE-gap:  {gp.conv_during_fire_gap}")
+        print(f"  conversion bracket SS-window: {gp.conv_during_ss_window}")
+        print(f"  wealth_responsiveness: {gp.wealth_responsiveness:.3f} "
+              f"(>0 means de-risk when ahead of target)")
     print(f"\nOptimizer diagnostics: nfev={diag['nfev']}, nit={diag['nit']}, "
           f"obj={diag['obj_value']:.3f}")
 
-    # Re-run with final_paths for accurate reporting
-    scn.target_allocations = allocations
-    scn.withdrawal.roth_conversion_target_bracket = conv_bracket
+    # Re-run with final_paths for accurate reporting using the same policy.
     scn.simulation.n_paths = final_paths
-    result = simulate(scn)
+    result = simulate(scn, policy=diag["policy"])
     _print_summary(scn, result, "Final evaluation at optimum")
 
 

@@ -38,6 +38,8 @@ from scipy.optimize import differential_evolution, minimize
 from .config import (Scenario, Allocation, TargetAllocations,
                      WithdrawalPolicy)
 from .location import heuristic_target_allocations
+from .policy import (Policy, StaticPolicy, GlidePolicy,
+                     build_glide_policy, GLIDE_PARAM_BOUNDS)
 from .simulate import simulate, SimResult
 
 
@@ -57,6 +59,11 @@ class OptimizerConfig:
     # 'heuristic' : optimize 4 vars (overall stock/bond + conv + split);
     #               location is fixed by the tax-efficient heuristic
     location_mode: str = "free"
+    # 'static' : single fixed Decision applied every year (legacy).
+    # 'glide'  : 16 vars — per-account 2-knot glide path + life-phase
+    #            conversion brackets + Trad/Roth split + wealth_responsiveness.
+    #            Each year's decision depends on age and FIRE progress.
+    policy_class: str = "static"
 
 
 def _alloc(s: float, b: float) -> Allocation:
@@ -108,39 +115,42 @@ def _crra(c: np.ndarray, gamma: float) -> np.ndarray:
     return (c ** (1.0 - gamma)) / (1.0 - gamma)
 
 
+def _build_policy(x: np.ndarray, scn_base: Scenario,
+                  cfg: OptimizerConfig) -> Policy:
+    """Decode `x` into a Policy according to cfg.policy_class /
+    cfg.location_mode."""
+    if cfg.policy_class == "glide":
+        start_age = scn_base.profile.age
+        end_age = (scn_base.profile.end_of_plan_date
+                   - scn_base.profile.birthdate).days / 365.25
+        retirement_age = (scn_base.profile.retirement_date
+                          - scn_base.profile.birthdate).days / 365.25
+        ss_age = float(scn_base.social_security.claim_age)
+        return build_glide_policy(list(x), start_age=start_age,
+                                  end_age=end_age,
+                                  retirement_age=retirement_age,
+                                  ss_age=ss_age)
+    # static
+    if cfg.location_mode == "heuristic":
+        allocations, conv_target, trad_split = _decode_heuristic(x, scn_base)
+    else:
+        allocations, conv_target, trad_split = _decode_free(x)
+    return StaticPolicy(allocations=allocations,
+                        conversion_bracket=conv_target,
+                        trad_contribution_split=trad_split)
+
+
 def _objective_for(scn_base: Scenario, cfg: OptimizerConfig
                    ) -> Callable[[np.ndarray], float]:
     horizon = scn_base.profile.horizon()
     years_to_retire = scn_base.profile.years_to_retirement()
 
     def obj(x: np.ndarray) -> float:
-        if cfg.location_mode == "heuristic":
-            allocations, conv_target, trad_split = _decode_heuristic(x, scn_base)
-        else:
-            allocations, conv_target, trad_split = _decode_free(x)
+        policy = _build_policy(x, scn_base, cfg)
         scn = deepcopy(scn_base)
-        scn.target_allocations = allocations
-        scn.withdrawal = WithdrawalPolicy(
-            strategy=scn_base.withdrawal.strategy,
-            roth_conversion_target_bracket=conv_target,
-            aca_magi_cap=scn_base.withdrawal.aca_magi_cap,
-        )
-        # Apply contribution split
-        c = scn.savings.contributions
-        # Total 401k pool: keep sum(trad_401k + roth_401k) constant if both
-        # are numeric; otherwise interpret 'max' literally on trad and 0 roth.
-        try:
-            tp = float(c.trad_401k) + float(c.roth_401k)
-            c.trad_401k = tp * trad_split
-            c.roth_401k = tp * (1.0 - trad_split)
-        except (TypeError, ValueError):
-            pass
-
-        # Run a smaller MC for speed
         scn.simulation.n_paths = cfg.n_paths_inner
-        # vary seed slightly each call to reduce variance of optimizer signal
         scn.simulation.seed = cfg.seed
-        result = simulate(scn)
+        result = simulate(scn, policy=policy)
 
         # Build per-path discounted utility of consumption
         n = len(result.paths)
@@ -173,7 +183,9 @@ def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
     """
     cfg = cfg or OptimizerConfig()
     obj = _objective_for(scn, cfg)
-    if cfg.location_mode == "heuristic":
+    if cfg.policy_class == "glide":
+        bounds = list(GLIDE_PARAM_BOUNDS)
+    elif cfg.location_mode == "heuristic":
         bounds = [
             (0.0, 1.0), (0.0, 1.0),  # overall stock, bond
             (0.0, 5.0),              # conversion bracket index
@@ -193,11 +205,28 @@ def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
         tol=1e-3, mutation=(0.5, 1.0), recombination=0.7,
         init="sobol", updating="deferred" if cfg.workers != 1 else "immediate",
     )
-    if cfg.location_mode == "heuristic":
+    policy = _build_policy(res.x, scn, cfg)
+    if cfg.policy_class == "glide":
+        # For glide, "current-year" allocations are policy.decide() at age 0.
+        from .policy import StateSummary
+        ss0 = StateSummary(
+            age=scn.profile.age, year_idx=0,
+            years_to_retirement=float(scn.profile.years_to_retirement()),
+            fire_target_real=25.0 * scn.spending.annual_real,
+            median_real_wealth=scn.initial_portfolio.total_value(),
+            fire_progress_ratio=1.0,
+        )
+        d0 = policy.decide(ss0)
+        allocations = d0.allocations
+        conv_target = d0.conversion_bracket
+        trad_split = d0.trad_contribution_split
+    elif cfg.location_mode == "heuristic":
         allocations, conv_target, trad_split = _decode_heuristic(res.x, scn)
     else:
         allocations, conv_target, trad_split = _decode_free(res.x)
     diag = {"obj_value": float(res.fun), "nit": int(res.nit), "nfev": int(res.nfev),
             "x": res.x.tolist(), "message": res.message,
-            "location_mode": cfg.location_mode}
+            "location_mode": cfg.location_mode,
+            "policy_class": cfg.policy_class,
+            "policy": policy}
     return allocations, conv_target, trad_split, diag
