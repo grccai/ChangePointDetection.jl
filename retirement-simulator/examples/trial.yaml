@@ -57,7 +57,7 @@ savings:
 spending:
   annual_real: 100000           # POST-TAX retirement spending in today's $
   smile: bengen
-  working_annual_real: 100000   # POST-TAX working-years living budget;
+  working_annual_real:  90000   # POST-TAX working-years living budget;
                                 # everything above (taxes + contribs + this)
                                 # flows to taxable savings.
   flexible:                     # variable-percentage withdrawal in retirement
