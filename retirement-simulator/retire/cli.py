@@ -258,6 +258,11 @@ def export_allocation(
                           "policy) | 'glide:<x>' (12 comma-separated floats) "
                           "| 'three_knot:<x>' (16 comma-separated floats)."),
     paths: int = typer.Option(5000, help="Number of MC paths to simulate."),
+    png: Path | None = typer.Option(None, help="Also write the chart as a "
+                                     "standalone PNG at this path."),
+    fire_target: float | None = typer.Option(None, help="Real-$ FIRE target "
+                                              "to mark on the chart (default: "
+                                              "25 * scn.spending.annual_real)."),
 ) -> None:
     """Run the simulator under a chosen policy and export year-by-year
     per-(account, asset) balances and contributions, with one sheet per
@@ -307,13 +312,20 @@ def export_allocation(
 
     horizon = scn.profile.horizon()
     ages = np.array([scn.profile.age_at_year(y) for y in range(horizon + 1)])
+    if fire_target is None:
+        fire_target = 25.0 * scn.spending.annual_real
     export_allocation_xlsx(out_path=out,
                            balance_by_year=result.real_balance_by_year,
                            contrib_by_year=result.real_contrib_by_year,
                            ages_at_year=ages,
                            policy_summary=f"{summary}   "
-                                          f"P(ruin)={100*fail:.2f}%")
-    print(f"Wrote {out}  ({horizon + 1} years × 5 quantile sheets)")
+                                          f"P(ruin)={100*fail:.2f}%",
+                           fire_target_real=fire_target,
+                           retirement_age=scn.profile.retirement_age,
+                           png_path=png)
+    print(f"Wrote {out}  ({horizon + 1} years × 5 quantile sheets + Charts)")
+    if png is not None:
+        print(f"Wrote chart PNG: {png}")
 
 
 @app.command()
