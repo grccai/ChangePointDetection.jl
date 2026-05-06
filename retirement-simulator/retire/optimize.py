@@ -101,6 +101,10 @@ class OptimizerConfig:
     # Total evaluation budget cap (only used by cma/bipop_cma; DE uses
     # popsize x maxiter x ndim from its own logic).
     max_evals: int | None = None
+    # For 'fire_prob_robust' objective: list of return_model strings to
+    # evaluate worst-case across. Default = ['gbm', 'historical'] when
+    # objective='fire_prob_robust'. Doubles per-eval MC cost.
+    robust_return_modes: list[str] | None = None
 
 
 def _alloc(s: float, b: float) -> Allocation:
@@ -313,8 +317,59 @@ class _FIREProbWeightedObjective:
         return -reward + penalty
 
 
+@dataclass
+class _FIREProbRobustObjective:
+    """Robust version: minimizes worst-case across multiple return modes.
+
+    For each candidate policy, runs MC under EACH return model in
+    `return_modes`, then:
+       reward = min over modes of (time-decayed FIRE-prob reward)
+       ruin   = max over modes of P(ruin) — applies to the penalty
+
+    The result is a policy whose worst-case (across i.i.d. lognormal AND
+    historical-bootstrap) outcome is as good as possible. Practical effect:
+    optimizer naturally values cash/bond buffers because they reduce the
+    historical-mode tail without proportionally hurting GBM-mode reward."""
+    scn_base: Scenario
+    cfg: OptimizerConfig
+    fire_age: int
+    fire_target_real: float
+    ruin_max: float
+    year_indices: list[int]
+    weights: np.ndarray
+    return_modes: list[str]      # e.g., ["gbm", "historical"]
+
+    def __call__(self, x: np.ndarray) -> float:
+        policy = _build_policy(x, self.scn_base, self.cfg)
+        rewards = []
+        ruins = []
+        for mode in self.return_modes:
+            scn = deepcopy(self.scn_base)
+            scn.simulation.n_paths = self.cfg.n_paths_inner
+            scn.simulation.seed = self.cfg.seed
+            scn.simulation.return_model = mode
+            result = simulate(scn, policy=policy)
+            wealth_arr = np.array([p.real_wealth_by_year for p in result.paths])
+            p_hit = np.array([
+                (wealth_arr[:, idx] >= self.fire_target_real).mean()
+                for idx in self.year_indices
+            ])
+            rewards.append(float((self.weights * p_hit).sum()))
+            ruins.append(float(result.failure_rate()))
+        worst_reward = min(rewards)
+        worst_ruin = max(ruins)
+        internal_target = max(0.0, self.ruin_max - 0.003)
+        slack = worst_ruin - internal_target
+        if slack <= 0:
+            penalty = 0.0
+        else:
+            penalty = 100.0 * slack + 100_000.0 * slack ** 2
+        return -worst_reward + penalty
+
+
 def _objective_for(scn_base: Scenario, cfg: OptimizerConfig):
-    if cfg.objective in ("fire_prob", "fire_prob_weighted"):
+    fire_objs = ("fire_prob", "fire_prob_weighted", "fire_prob_robust")
+    if cfg.objective in fire_objs:
         fire_age = cfg.fire_age if cfg.fire_age is not None \
             else int(round(scn_base.profile.retirement_age))
         fire_target = cfg.fire_target_real if cfg.fire_target_real is not None \
@@ -330,17 +385,26 @@ def _objective_for(scn_base: Scenario, cfg: OptimizerConfig):
                 ruin_max=cfg.ruin_max,
                 year_idx_at_fire=year_idx_at_fire,
             )
-        # fire_prob_weighted
         year_indices = [
             min(horizon, max(0, int(round(fire_age + i - start_age))))
             for i in range(11)
         ]
         weights = np.array([1.0 - i / 10.0 for i in range(11)])
-        return _FIREProbWeightedObjective(
+        if cfg.objective == "fire_prob_weighted":
+            return _FIREProbWeightedObjective(
+                scn_base=scn_base, cfg=cfg,
+                fire_age=fire_age, fire_target_real=fire_target,
+                ruin_max=cfg.ruin_max,
+                year_indices=year_indices, weights=weights,
+            )
+        # fire_prob_robust
+        modes = cfg.robust_return_modes or ["gbm", "historical"]
+        return _FIREProbRobustObjective(
             scn_base=scn_base, cfg=cfg,
             fire_age=fire_age, fire_target_real=fire_target,
             ruin_max=cfg.ruin_max,
             year_indices=year_indices, weights=weights,
+            return_modes=list(modes),
         )
     return _Objective(
         scn_base=scn_base, cfg=cfg,

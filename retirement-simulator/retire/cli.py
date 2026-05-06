@@ -105,10 +105,9 @@ def optimize_cmd(
     objective: str = typer.Option(
         "utility",
         help="'utility' (CRRA + bequest + failure penalty) | 'fire_prob' "
-             "(maximize P(wealth at --fire-age >= --fire-target) subject to "
-             "P(ruin) <= --ruin-max) | 'fire_prob_weighted' (time-decayed "
-             "11-year sum of FIRE probabilities, max value 5.5; same ruin "
-             "constraint).",
+             "| 'fire_prob_weighted' (time-decayed 11-year sum, max 5.5) | "
+             "'fire_prob_robust' (worst-case of fire_prob_weighted across "
+             "GBM and historical return modes; doubles per-eval MC cost).",
     ),
     fire_age: int = typer.Option(50, help="FIRE target age (only for fire_prob)."),
     fire_target: float = typer.Option(2_500_000, help="Real-dollar FIRE target "
@@ -118,7 +117,7 @@ def optimize_cmd(
 ) -> None:
     """Optimize allocation and contribution split for the scenario."""
     scn = load_scenario(config)
-    fire_objs = {"fire_prob", "fire_prob_weighted"}
+    fire_objs = {"fire_prob", "fire_prob_weighted", "fire_prob_robust"}
     cfg = OptimizerConfig(gamma=gamma, n_paths_inner=paths, maxiter=maxiter,
                          popsize=popsize, workers=workers,
                          location_mode=location_mode, policy_class=policy,
@@ -200,7 +199,33 @@ def optimize_cmd(
     result = simulate(scn, policy=diag["policy"])
     _print_summary(scn, result, "Final evaluation at optimum")
 
-    if objective in ("fire_prob", "fire_prob_weighted"):
+    if objective == "fire_prob_robust":
+        import numpy as np
+        from copy import deepcopy
+        # Re-evaluate the optimum under EACH mode to give per-mode metrics.
+        print(f"\n=== fire_prob_robust: per-mode final evaluation ===")
+        modes = ["gbm", "historical"]
+        start_age = scn.profile.age
+        horizon = scn.profile.horizon()
+        year_indices = [min(horizon, max(0, int(round(fire_age + i - start_age))))
+                         for i in range(11)]
+        weights = np.array([1.0 - i / 10.0 for i in range(11)])
+        for mode in modes:
+            scn_m = deepcopy(scn)
+            scn_m.simulation.return_model = mode
+            scn_m.simulation.n_paths = final_paths
+            r_m = simulate(scn_m, policy=diag["policy"])
+            wealth = np.array([p.real_wealth_by_year for p in r_m.paths])
+            p_hit = np.array([
+                (wealth[:, idx] >= fire_target).mean() for idx in year_indices
+            ])
+            reward_m = float((weights * p_hit).sum())
+            ruin_m = r_m.failure_rate()
+            feas_m = "FEASIBLE" if ruin_m <= ruin_max else "INFEASIBLE"
+            print(f"  mode={mode:<11}  reward={reward_m:.3f}  "
+                  f"P(W_50>=T)={100*p_hit[0]:.2f}%  P(W_55>=T)={100*p_hit[5]:.2f}%  "
+                  f"P(ruin)={100*ruin_m:.2f}%  --> {feas_m}")
+    elif objective in ("fire_prob", "fire_prob_weighted"):
         import numpy as np
         start_age = scn.profile.age
         horizon = scn.profile.horizon()
