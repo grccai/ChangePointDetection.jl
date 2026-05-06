@@ -44,6 +44,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
+import numpy as np
+
 from .config import Allocation, TargetAllocations
 
 
@@ -566,6 +568,144 @@ CPPI_PARAM_BOUNDS: list[tuple[float, float]] = [
     (-0.02, 0.05),   # floor_growth_rate
     (1.0, 5.0),      # multiplier
     (0.0, 1.0),      # upper_stock_cap
+    (0.0, 0.4),      # taxable_cash
+    (0.0, 5.0),      # conv FIRE-gap idx
+    (0.0, 5.0),      # conv SS-window idx
+    (0.0, 1.0),      # trad split
+]
+
+
+# ---------- Bodie-Merton Human-Capital Glide ----------
+
+@dataclass
+class BodieMertonPolicy:
+    """Allocation derived from the Merton optimal-portfolio formula applied
+    to *total* economic wealth (financial + human capital), where HC is
+    treated as a bond.
+
+        target_total_stock = (μ_excess) / (γ · σ²)   ← Merton constant
+        HC(t) = PV of remaining real wages, discounted at hc_discount_rate
+        total = W + HC
+        stock_in_W = clamp(target_total_stock · total / W, 0, 1)
+
+    The "glide" emerges endogenously: as HC depletes with age, the
+    financial portfolio's stock fraction declines from ~100% (HC large)
+    toward the Merton constant (HC = 0). Two fundamentals (γ, r_hc) do
+    the work of many free knots.
+
+    HC trajectory is pre-computed at policy build time from the scenario's
+    income sources + deterministic inflation."""
+    hc_by_year: np.ndarray              # (H+1,)
+    target_total_stock_frac: float      # Merton constant, derived from γ and market
+    taxable_cash: float = 0.0
+
+    conv_during_fire_gap: float | None = None
+    conv_during_ss_window: float | None = None
+    trad_contribution_split: float = 1.0
+
+    retirement_age: float = 0.0
+    ss_age: float = 67.0
+    rmd_age: float = 73.0
+
+    def decide(self, ss: StateSummary) -> Decision:
+        age = ss.age
+        year_idx = ss.year_idx
+        if year_idx < len(self.hc_by_year):
+            HC = self.hc_by_year[year_idx]
+        else:
+            HC = 0.0
+        W = max(1.0, ss.median_real_wealth)
+        total = W + HC
+        raw_stock = self.target_total_stock_frac * total / W
+        stock = _clip(raw_stock)
+
+        tax_cash = _clip(self.taxable_cash, 0.0, max(0.0, 1.0 - stock))
+        tax = _alloc(stock, max(0.0, 1.0 - stock - tax_cash))
+        trad = _alloc(stock, max(0.0, 1.0 - stock))
+        roth = _alloc(stock, max(0.0, 1.0 - stock))
+
+        if age < self.retirement_age:
+            conv = None
+        elif age < self.ss_age:
+            conv = self.conv_during_fire_gap
+        elif age < self.rmd_age:
+            conv = self.conv_during_ss_window
+        else:
+            conv = None
+
+        return Decision(
+            allocations=TargetAllocations(taxable=tax, traditional=trad, roth=roth),
+            conversion_bracket=conv,
+            trad_contribution_split=self.trad_contribution_split,
+        )
+
+
+def _compute_hc_trajectory(scn, r_hc: float) -> np.ndarray:
+    """For each year_idx, compute the present value (in real dollars) of all
+    future real wages, discounted at r_hc."""
+    horizon = scn.profile.horizon()
+    sim_start = scn.profile.start_date
+    timeline = scn.state_taxes
+    inflation_rate = scn.market.inflation_mean
+    real_wages = np.zeros(horizon)
+    deflator = 1.0
+    for y in range(horizon):
+        deflator *= (1.0 + inflation_rate)
+        nominal = timeline.total_wages(sim_start, y)
+        real_wages[y] = nominal / deflator
+    hc = np.zeros(horizon + 1)
+    discount = (1.0 + r_hc)
+    for y_now in range(horizon + 1):
+        pv = 0.0
+        for y in range(y_now, horizon):
+            pv += real_wages[y] / discount ** (y - y_now)
+        hc[y_now] = pv
+    return hc
+
+
+def build_bodie_merton_policy(x: list[float] | tuple[float, ...],
+                               scn,
+                               retirement_age: float, ss_age: float = 67.0,
+                               rmd_age: float = 73.0) -> BodieMertonPolicy:
+    """Decode a 6-element vector to a BodieMertonPolicy.
+
+    Parameter layout:
+      0  risk_aversion (γ)         [1.0, 10.0]   typical 2-5
+      1  hc_discount_rate (r_hc)   [0.0, 0.08]   real, typical 0.02-0.04
+      2  taxable_cash              [0, 0.4]
+      3  conv FIRE-gap idx         (snapped)
+      4  conv SS-window idx        (snapped)
+      5  trad split                [0, 1]"""
+    if len(x) != 6:
+        raise ValueError(f"expected 6 params for bodie_merton, got {len(x)}")
+    gamma = max(1.0, min(10.0, x[0]))
+    r_hc = max(0.0, min(0.08, x[1]))
+    # Merton constant: target stock fraction of TOTAL wealth.
+    mu_stock = scn.market.stocks.real_return
+    sigma_stock = scn.market.stocks.vol
+    r_riskfree = scn.market.cash.real_return
+    excess = mu_stock - r_riskfree
+    if sigma_stock <= 0:
+        target_total = 1.0 if excess > 0 else 0.0
+    else:
+        target_total = max(0.0, min(1.0, excess / (gamma * sigma_stock ** 2)))
+    hc_traj = _compute_hc_trajectory(scn, r_hc)
+    return BodieMertonPolicy(
+        hc_by_year=hc_traj,
+        target_total_stock_frac=target_total,
+        taxable_cash=_clip(x[2], 0.0, 0.4),
+        conv_during_fire_gap=_snap_bracket(x[3]),
+        conv_during_ss_window=_snap_bracket(x[4]),
+        trad_contribution_split=_clip(x[5]),
+        retirement_age=retirement_age,
+        ss_age=ss_age,
+        rmd_age=rmd_age,
+    )
+
+
+BODIE_MERTON_PARAM_BOUNDS: list[tuple[float, float]] = [
+    (1.0, 10.0),     # risk_aversion
+    (0.0, 0.08),     # hc_discount_rate
     (0.0, 0.4),      # taxable_cash
     (0.0, 5.0),      # conv FIRE-gap idx
     (0.0, 5.0),      # conv SS-window idx

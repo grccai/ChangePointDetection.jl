@@ -227,6 +227,37 @@ def test_cppi_param_bounds_length():
     assert len(CPPI_PARAM_BOUNDS) == 8
 
 
+def test_bodie_merton_glide_emerges():
+    """Bodie-Merton: stock fraction starts at 100% (large HC) and falls
+    toward the Merton constant as HC depletes."""
+    import os
+    from retire.config import load_scenario
+    from retire.policy import build_bodie_merton_policy
+    # Path is relative to repo root when running via pytest tests/
+    yaml_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "examples", "trial.yaml")
+    scn = load_scenario(yaml_path)
+    # gamma=3 -> target_total ≈ (0.06-0.005)/(3*0.18^2) ≈ 0.566
+    x = [3.0, 0.03, 0.05, 0.0, 0.0, 1.0]
+    p = build_bodie_merton_policy(x, scn=scn,
+                                   retirement_age=scn.profile.retirement_age)
+    # Year-0: HC is large, stock_frac in W should clamp at 1.0
+    d_now = p.decide(_ss(age=37, year_idx=0, wealth=644_000, target=2_500_000))
+    assert d_now.allocations.taxable.stock > 0.9
+    # At retirement (year 18): HC = 0, stock_frac in W = target_total ≈ 0.57
+    d_ret = _ss(age=55, year_idx=18, wealth=2_500_000, target=2_500_000)
+    d_ret.median_real_wealth = 2_500_000
+    d_ret_dec = p.decide(d_ret)
+    # Should be near the Merton constant; allow generous tolerance
+    assert 0.4 < d_ret_dec.allocations.taxable.stock < 0.7
+
+
+def test_bodie_merton_param_bounds_length():
+    from retire.policy import BODIE_MERTON_PARAM_BOUNDS
+    assert len(BODIE_MERTON_PARAM_BOUNDS) == 6
+
+
 def test_three_knot_glide_decoder():
     from retire.policy import (build_three_knot_glide_policy,
                                 THREE_KNOT_GLIDE_PARAM_BOUNDS)

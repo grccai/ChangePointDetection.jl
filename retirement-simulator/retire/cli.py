@@ -90,11 +90,10 @@ def optimize_cmd(
     ),
     policy: str = typer.Option(
         "static",
-        help="'static' (single fixed Decision per year) | 'glide' (2-knot "
-             "glide, 12 vars) | 'three_knot_glide' (3-knot glide w/ mid-"
-             "knot at retirement, 16 vars) | 'bond_tent' (V-shaped equity "
-             "around retirement, 9 vars; Kitces-Pfau) | 'cppi' (wealth-"
-             "anchored constant proportion portfolio insurance, 8 vars).",
+        help="'static' | 'glide' (2-knot, 12 vars) | 'three_knot_glide' "
+             "(16 vars) | 'bond_tent' (V-shape, 9 vars; Kitces-Pfau) | "
+             "'cppi' (wealth-floor-anchored, 8 vars) | 'bodie_merton' "
+             "(human-capital glide, 6 vars; theoretically grounded).",
     ),
     objective: str = typer.Option(
         "utility",
@@ -173,6 +172,18 @@ def optimize_cmd(
         print(f"  taxable cash fraction:       {c.taxable_cash:.2%}")
         print(f"  conv FIRE-gap:               {c.conv_during_fire_gap}")
         print(f"  conv SS-window:              {c.conv_during_ss_window}")
+    elif diag["policy_class"] == "bodie_merton":
+        bm = diag["policy"]
+        print()
+        print(f"Bodie-Merton Human-Capital Glide:")
+        print(f"  Merton constant (target stock of total wealth): "
+              f"{bm.target_total_stock_frac:.2%}")
+        print(f"  HC at year 0:                ${bm.hc_by_year[0]:>12,.0f}")
+        print(f"  HC at year 5:                ${bm.hc_by_year[5]:>12,.0f}")
+        print(f"  HC at retirement:            ${bm.hc_by_year[18] if len(bm.hc_by_year) > 18 else 0:>12,.0f}")
+        print(f"  taxable cash fraction:       {bm.taxable_cash:.2%}")
+        print(f"  conv FIRE-gap:               {bm.conv_during_fire_gap}")
+        print(f"  conv SS-window:              {bm.conv_during_ss_window}")
     print(f"\nOptimizer diagnostics: nfev={diag['nfev']}, nit={diag['nit']}, "
           f"obj={diag['obj_value']:.3f}")
 
