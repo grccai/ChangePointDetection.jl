@@ -137,6 +137,7 @@ class SimResult:
     # Useful for downstream Excel/CSV export at quantile granularity.
     real_balance_by_year: np.ndarray | None = None    # (P, H+1, 3, 3)
     real_contrib_by_year: np.ndarray | None = None    # (P, H, 3, 3)
+    real_equity_by_year: np.ndarray | None = None     # (P, H+1) rental equity
 
     @property
     def n_paths(self) -> int:
@@ -475,6 +476,16 @@ def simulate(scn: Scenario,
         s.age_st_to_lt()
         s.real_wealth[:, y + 1] = s.total_value() / s.cumulative_inflation
         _record_balances(s, year_idx=y + 1)
+        # Record property equity in real $: net of mortgage AND HELOC. This
+        # is the "if I sold today and paid off both the mortgage and the
+        # HELOC" residual, which is the honest contribution to total wealth.
+        if scn.rental_property is not None and s.rental_owned.any():
+            cum_infl = s.cumulative_inflation
+            eq_real = (s.rental_value_real
+                       - (s.mortgage_balance_nominal
+                          + s.heloc_balance_nominal) / cum_infl)
+            eq_real = np.where(s.rental_owned, np.maximum(0.0, eq_real), 0.0)
+            s.real_equity_by_year[:, y + 1] = eq_real
         if age >= retirement_age:
             # Ruin: taxable+401k+roth all depleted AND no HELOC capacity left.
             # When rental is configured, the equity backstop softens ruin.
@@ -498,7 +509,8 @@ def simulate(scn: Scenario,
         ))
     return SimResult(paths=paths,
                      real_balance_by_year=s.real_balance_by_year.copy(),
-                     real_contrib_by_year=s.real_contrib_by_year.copy())
+                     real_contrib_by_year=s.real_contrib_by_year.copy(),
+                     real_equity_by_year=s.real_equity_by_year.copy())
 
 
 # ---------- Per-year accumulation step ----------

@@ -76,6 +76,11 @@ class VState:
     # dividing by cumulative_inflation at end of each year).
     real_balance_by_year: np.ndarray   # (P, H + 1, 3, 3)
     real_contrib_by_year: np.ndarray   # (P, H, 3, 3) — fresh deposits only
+    # Property equity per (path, year) in real dollars. Equity = property
+    # value − mortgage balance − HELOC balance, all in nominal then deflated.
+    # Zero for paths that never own. Recorded after each year's step.
+    real_equity_by_year: np.ndarray = field(  # (P, H + 1)
+        default_factory=lambda: np.zeros((0, 0)))
 
     # Rental property (optional). All paths share the same scalar config in
     # the Scenario; per-path arrays track owned-state + value + debt. When
@@ -116,6 +121,7 @@ class VState:
             real_shortfall=np.zeros((n_paths, horizon)),
             real_balance_by_year=np.zeros((n_paths, horizon + 1, 3, 3)),
             real_contrib_by_year=np.zeros((n_paths, horizon, 3, 3)),
+            real_equity_by_year=np.zeros((n_paths, horizon + 1)),
             rental_owned=np.zeros(n_paths, dtype=bool),
             rental_value_real=np.zeros(n_paths),
             mortgage_balance_nominal=np.zeros(n_paths),

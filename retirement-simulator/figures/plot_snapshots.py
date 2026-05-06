@@ -69,6 +69,19 @@ def load(strategy: str, mode: str):
     return np.load(p, allow_pickle=False)
 
 
+def augmented_wealth(d) -> np.ndarray:
+    """Total real wealth = portfolio + property equity.
+
+    `equity` may be missing (older snapshots) or all-zero (no rental); in
+    either case this just returns the portfolio wealth."""
+    W = d["wealth"]
+    if "equity" in d.files:
+        eq = d["equity"]
+        if eq.shape == W.shape:
+            return W + eq
+    return W
+
+
 def fan_panel(ax, ages, wealth, title=None, ymax=None):
     qs = [0.05, 0.25, 0.5, 0.75, 0.95]
     Q = np.quantile(wealth, qs, axis=0) / 1e6
@@ -98,7 +111,7 @@ def fan_grid():
         for c, mode in enumerate(RETURN_MODES):
             d = load(strat, mode)
             cells[(strat, mode)] = d
-            ymax = max(ymax, np.quantile(d["wealth"], 0.95) / 1e6)
+            ymax = max(ymax, np.quantile(augmented_wealth(d), 0.95) / 1e6)
     ymax = float(np.ceil(ymax / 5.0) * 5.0)
     for r, strat in enumerate(STRATEGIES):
         for c, mode in enumerate(RETURN_MODES):
@@ -106,10 +119,10 @@ def fan_grid():
             ax = axes[r, c]
             ages = d["ages"]
             ruin = float(d["failure_rate"])
-            p_fire = (d["wealth"][:, 18] >= FIRE_TARGET).mean()
+            p_fire = (augmented_wealth(d)[:, 18] >= FIRE_TARGET).mean()
             title = (f"{STRAT_LABELS[strat]} | {MODE_LABELS[mode]}\n"
                      f"P(W55>=2.5M)={100*p_fire:.0f}%, P(ruin)={100*ruin:.1f}%")
-            fan_panel(ax, ages, d["wealth"], title=title, ymax=ymax)
+            fan_panel(ax, ages, augmented_wealth(d), title=title, ymax=ymax)
             if c == 0:
                 ax.set_ylabel("real wealth ($M)")
             if r == rows - 1:
@@ -142,7 +155,7 @@ def fire_ruin_grid():
         for strat in STRATEGIES:
             d = load(strat, mode)
             ages = d["ages"]
-            wealth = d["wealth"]
+            wealth = augmented_wealth(d)
             p_fire = (wealth >= FIRE_TARGET).mean(axis=0)
             # P(ruin) by age = P(min(W[0..t]) <= 0) — cumulative
             ruined = (wealth <= 0).cumsum(axis=1) > 0
@@ -172,15 +185,29 @@ def fire_ruin_grid():
     print(f"  wrote {out}")
 
 
-def allocation_panel(ax, ages, balances_path, title=None):
-    """Stack (stock, bond, cash) totals across all accounts."""
+def allocation_panel(ax, ages, balances_path, equity_path=None, title=None):
+    """Stack (stock, bond, cash, [real_estate]) totals across all accounts.
+
+    `equity_path` is a (H+1,) real-$ array of property equity for the
+    selected path; passed only when a rental property exists. Otherwise
+    the chart shows the original 3-asset breakdown."""
     # balances: (H+1, 3, 3) -> sum over accounts
     by_asset = balances_path.sum(axis=1)   # (H+1, 3)
-    total = by_asset.sum(axis=1).clip(min=1.0)
-    frac = by_asset / total[:, None]
-    ax.stackplot(ages, frac[:, 0], frac[:, 1], frac[:, 2],
-                 labels=["stock", "bond", "cash"],
-                 colors=["#4878d0", "#ee854a", "#d5d5d5"], alpha=0.95)
+    if equity_path is not None and (equity_path > 0).any():
+        eq_col = equity_path.reshape(-1, 1)
+        by_all = np.concatenate([by_asset, eq_col], axis=1)   # (H+1, 4)
+        total = by_all.sum(axis=1).clip(min=1.0)
+        frac = by_all / total[:, None]
+        ax.stackplot(ages, frac[:, 0], frac[:, 1], frac[:, 2], frac[:, 3],
+                     labels=["stock", "bond", "cash", "real estate"],
+                     colors=["#4878d0", "#ee854a", "#d5d5d5", "#6a4c93"],
+                     alpha=0.95)
+    else:
+        total = by_asset.sum(axis=1).clip(min=1.0)
+        frac = by_asset / total[:, None]
+        ax.stackplot(ages, frac[:, 0], frac[:, 1], frac[:, 2],
+                     labels=["stock", "bond", "cash"],
+                     colors=["#4878d0", "#ee854a", "#d5d5d5"], alpha=0.95)
     ax.set_ylim(0, 1)
     ax.set_xlim(ages[0], ages[-1])
     if title:
@@ -203,9 +230,10 @@ def allocation_grid():
             d = load(strat, mode)
             ages = d["ages"]
             balances = d["balances"]   # (P, H+1, 3, 3)
-            idx = median_path_idx(d["wealth"])
+            idx = median_path_idx(augmented_wealth(d))
             ax = axes[r, c]
-            allocation_panel(ax, ages, balances[idx],
+            eq_p = d["equity"][idx] if "equity" in d.files else None
+            allocation_panel(ax, ages, balances[idx], equity_path=eq_p,
                              title=f"{STRAT_LABELS[strat]} | "
                                    f"{MODE_LABELS[mode]}")
             if c == 0:
@@ -213,7 +241,7 @@ def allocation_grid():
             if r == rows - 1:
                 ax.set_xlabel("age")
     handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=3,
+    fig.legend(handles, labels, loc="upper center", ncol=4,
                bbox_to_anchor=(0.5, 0.995), fontsize=9, frameon=False)
     fig.suptitle(f"Asset allocation along the median wealth path  "
                  f"[{FIG_LABEL}]", fontsize=12, y=1.01)
@@ -241,7 +269,7 @@ def spaghetti_grid(n_show: int = 80, seed: int = 0):
             d = cells[(strat, mode)]
             ax = axes[r, c]
             ages = d["ages"]
-            W = d["wealth"] / 1e6
+            W = augmented_wealth(d) / 1e6
             P = W.shape[0]
             idx = rng.choice(P, size=min(n_show, P), replace=False)
             for i in idx:
@@ -283,7 +311,7 @@ def richbrokedead_grid():
             d = load(strat, mode)
             ax = axes[r, c]
             ages = d["ages"]
-            W = d["wealth"]
+            W = augmented_wealth(d)
             S = survival_curve(ages)               # P(alive | age)
             p_dead = 1.0 - S
             p_alive_rich = S * (W >= FIRE_TARGET).mean(axis=0)
@@ -333,7 +361,7 @@ def summary_table():
     for strat in STRATEGIES:
         for mode in RETURN_MODES:
             d = load(strat, mode)
-            W = d["wealth"]
+            W = augmented_wealth(d)
             p50 = (W[:, 13] >= FIRE_TARGET).mean()
             p55 = (W[:, 18] >= FIRE_TARGET).mean()
             ruin = float(d["failure_rate"])

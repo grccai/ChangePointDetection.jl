@@ -104,9 +104,13 @@ def run_one(strategy_name: str, policy, scn, return_mode: str,
     failed = np.array([p.failed for p in result.paths])
     ages = np.array([scn.profile.age_at_year(y) for y in range(H1)])
     bal = result.real_balance_by_year  # (P, H+1, 3, 3)
+    eq = result.real_equity_by_year      # (P, H+1) — rental equity
+    if eq is None:
+        eq = np.zeros((P, H1), dtype=np.float32)
     out = os.path.join(snap_dir, f"{strategy_name}__{return_mode}.npz")
     np.savez_compressed(out,
                         wealth=wealth.astype(np.float32),
+                        equity=eq.astype(np.float32),
                         spending=spend.astype(np.float32),
                         balances=bal.astype(np.float32) if bal is not None
                                   else np.zeros((P, H1, 3, 3), dtype=np.float32),
