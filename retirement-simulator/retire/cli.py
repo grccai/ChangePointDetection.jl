@@ -48,9 +48,17 @@ def simulate_cmd(
                                   help="YAML scenario file."),
     paths_csv: Path | None = typer.Option(None, help="Optional CSV output of "
                                           "year-by-year median real wealth"),
+    return_model: str | None = typer.Option(
+        None,
+        help="Override scn.simulation.return_model. One of: 'gbm' (default; "
+             "lognormal MC), 'deterministic' (fast rough approximation; one "
+             "path at the configured means), 'historical' (block-bootstrap "
+             "from US 1928-2023 annual real returns)."),
 ) -> None:
     """Run a Monte Carlo simulation of the scenario as configured."""
     scn = load_scenario(config)
+    if return_model is not None:
+        scn.simulation.return_model = return_model
     result = simulate(scn)
     _print_summary(scn, result, "Simulation")
     if paths_csv:

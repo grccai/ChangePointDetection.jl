@@ -121,3 +121,70 @@ def block_bootstrap(history: np.ndarray, n_years: int, n_paths: int,
             out[p, t:t + take] = blk[:take]
             t += take
     return out
+
+
+# ---------- Deterministic and historical sampling ----------
+
+def sample_deterministic_paths(model: MarketModel, n_years: int, n_paths: int
+                                ) -> dict[Asset, np.ndarray]:
+    """All paths identical, every year equal to each asset's *geometric*
+    (CAGR) real return.
+
+    Why geometric, not arithmetic: compounding the arithmetic mean
+    `(1+μ_arith)^N` overstates the expected wealth by approximately
+    `exp(0.5·σ²·N)` because of Jensen's inequality / lognormal variance
+    drag. The geometric mean `(1+μ_arith) / sqrt(1 + σ²/(1+μ_arith)²)` is
+    what the GBM *median* path delivers, and it's what most "rough
+    approximation" planning intuition assumes.
+
+    For stocks (μ=6%, σ=18%) this changes the per-year deterministic
+    return from 0.060 to ~0.044 (CAGR), bringing terminal wealth in line
+    with the GBM median rather than its inflated arithmetic mean.
+
+    The simulator typically forces n_paths=1 here since all paths are
+    degenerate."""
+    out: dict[Asset, np.ndarray] = {}
+    for a in (Asset.STOCK, Asset.BOND, Asset.CASH):
+        mu = model.params[a].real_return
+        sd = model.params[a].vol
+        # Geometric mean under lognormal: log(1+r) ~ N(mu_log, sd_log^2),
+        # so median(1+r) = exp(mu_log) = (1+mu) / sqrt(1 + sd^2/(1+mu)^2).
+        if sd > 0 and (1 + mu) > 0:
+            cagr = (1 + mu) / np.sqrt(1 + (sd ** 2) / (1 + mu) ** 2) - 1
+        else:
+            cagr = mu
+        out[a] = np.full((n_paths, n_years), cagr)
+    return out
+
+
+def sample_deterministic_inflation(model: MarketModel, n_years: int,
+                                    n_paths: int) -> np.ndarray:
+    return np.full((n_paths, n_years), model.inflation_mean)
+
+
+def sample_historical_paths(n_years: int, n_paths: int,
+                             seed: int | None = None,
+                             block_size: int = 1
+                             ) -> tuple[dict[Asset, np.ndarray], np.ndarray]:
+    """Bootstrap historical real returns. Each path is built from blocks of
+    consecutive years drawn from the embedded 1928-2023 US real-return
+    series; with `block_size=1` this is plain stationary bootstrap, with
+    larger block_size it preserves within-block sequencing (preferred for
+    capturing real bull/bear regimes).
+
+    Returns (returns_dict, inflation_array). The inflation array is the
+    realised CPI for each sampled year, used for nominal/real conversion
+    inside the simulator. Stocks/bonds/cash returns are already in real
+    terms, so the simulator's `cumulative_inflation` only affects nominal
+    items (wages, taxes, SS, etc.).
+    """
+    from . import historical_data as hd
+    years, stock, bond, cash = hd.real_returns()
+    infl = hd.INFLATION
+    history = np.stack([stock, bond, cash, infl], axis=-1)   # (T, 4)
+    samples = block_bootstrap(history, n_years=n_years, n_paths=n_paths,
+                               block_size=block_size, seed=seed)
+    return ({Asset.STOCK: samples[..., 0],
+             Asset.BOND:  samples[..., 1],
+             Asset.CASH:  samples[..., 2]},
+            samples[..., 3])

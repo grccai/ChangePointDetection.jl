@@ -216,7 +216,18 @@ class TargetAllocations:
 class SimulationParams:
     n_paths: int = 5000
     seed: int = 42
-    return_model: Literal["gbm", "bootstrap"] = "gbm"
+    # 'gbm'           : correlated lognormal sampling from the configured
+    #                   means/vols/correlations (default).
+    # 'deterministic' : every year uses each asset's `real_return` exactly
+    #                   and inflation_mean exactly. Forces n_paths=1 since
+    #                   all paths would be identical. Use for fast rough
+    #                   approximations / sanity checks.
+    # 'historical'    : block-bootstrap from the embedded US 1928-2023
+    #                   annual real returns (S&P 500, 10y T-bond, 3mo
+    #                   T-bill) with realised CPI for inflation. Captures
+    #                   real bull/bear sequence-of-returns dynamics.
+    return_model: Literal["gbm", "deterministic", "historical",
+                          "bootstrap"] = "gbm"
 
 
 @dataclass

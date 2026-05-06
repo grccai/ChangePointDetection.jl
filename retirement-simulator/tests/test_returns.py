@@ -52,3 +52,50 @@ def test_inflation_deterministic():
     )
     inf = sample_inflation(model, 5, 100, seed=0)
     assert np.allclose(inf, 0.03)
+
+
+def test_sample_deterministic_paths_returns_geometric():
+    """Deterministic mode uses geometric mean (CAGR), not arithmetic, so the
+    deterministic terminal wealth aligns with the GBM *median* path."""
+    from retire.returns import sample_deterministic_paths
+    model = MarketModel(
+        params={Asset.STOCK: AssetParams(0.06, 0.18),
+                Asset.BOND:  AssetParams(0.02, 0.06),
+                Asset.CASH:  AssetParams(0.005, 0.01)},
+        correlation=np.eye(3),
+    )
+    out = sample_deterministic_paths(model, n_years=5, n_paths=3)
+    # CAGR = (1+mu) / sqrt(1 + sd^2/(1+mu)^2) - 1
+    expected_stock = 1.06 / np.sqrt(1 + 0.18**2 / 1.06**2) - 1
+    expected_bond = 1.02 / np.sqrt(1 + 0.06**2 / 1.02**2) - 1
+    expected_cash = 1.005 / np.sqrt(1 + 0.01**2 / 1.005**2) - 1
+    assert np.allclose(out[Asset.STOCK], expected_stock)
+    assert np.allclose(out[Asset.BOND], expected_bond)
+    assert np.allclose(out[Asset.CASH], expected_cash)
+    # Stocks: ~4.4% CAGR (vs 6% arithmetic)
+    assert 0.040 < expected_stock < 0.050
+
+
+def test_sample_historical_paths_dimensions_and_range():
+    from retire.returns import sample_historical_paths
+    rets, infl = sample_historical_paths(n_years=30, n_paths=100, seed=0)
+    for a in (Asset.STOCK, Asset.BOND, Asset.CASH):
+        assert rets[a].shape == (100, 30)
+        # Real returns should fall within historical extremes
+        assert (rets[a].min() > -0.6) and (rets[a].max() < 0.7)
+    assert infl.shape == (100, 30)
+    # CPI bounds: deflation ~ -10% (1932), inflation ~ +18% (1946)
+    assert (infl.min() > -0.12) and (infl.max() < 0.20)
+
+
+def test_historical_data_loads():
+    from retire import historical_data as hd
+    yrs, s, b, c = hd.real_returns()
+    assert len(yrs) >= 90 and len(yrs) == len(s) == len(b) == len(c)
+    # Geometric average real returns over the full period (sanity: stocks
+    # ~5-7%, bonds ~1-3%, cash ~0-1%).
+    def cagr(arr):
+        return float(np.prod(1 + arr) ** (1 / len(arr)) - 1)
+    assert 0.04 < cagr(s) < 0.09, f"stock real CAGR {cagr(s):.3f}"
+    assert 0.00 < cagr(b) < 0.04, f"bond real CAGR  {cagr(b):.3f}"
+    assert -0.005 < cagr(c) < 0.02, f"cash real CAGR {cagr(c):.3f}"

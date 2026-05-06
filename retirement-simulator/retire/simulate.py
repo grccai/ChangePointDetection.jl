@@ -19,7 +19,10 @@ from .accounts import Asset
 from .config import (Scenario, Allocation, TargetAllocations,
                      WithdrawalPolicy, Spending)
 from .policy import (Policy, StaticPolicy, Decision, StateSummary)
-from .returns import sample_gbm_paths, sample_inflation
+from .returns import (sample_gbm_paths, sample_inflation,
+                      sample_deterministic_paths,
+                      sample_deterministic_inflation,
+                      sample_historical_paths)
 from .state_taxes import (StateTimeline, state_tax_vec, state_wages_tax,
                           state_residency_tax_vec)
 from .taxes import (TAX_2024, TaxYear, FilingStatus, Bracket,
@@ -250,8 +253,20 @@ def simulate(scn: Scenario,
     seed = scn.simulation.seed
     market = scn.market.to_market_model()
 
-    returns_by_asset = sample_gbm_paths(market, horizon, P, seed=seed)
-    inflation = sample_inflation(market, horizon, P, seed=(seed or 0) + 1)
+    return_model = scn.simulation.return_model
+    if return_model == "deterministic":
+        # All paths are identical; force a single path to skip wasted compute.
+        P = 1
+        returns_by_asset = sample_deterministic_paths(market, horizon, P)
+        inflation = sample_deterministic_inflation(market, horizon, P)
+    elif return_model in ("historical", "bootstrap"):
+        returns_by_asset, inflation = sample_historical_paths(
+            n_years=horizon, n_paths=P, seed=seed, block_size=1)
+    else:
+        # gbm (default)
+        returns_by_asset = sample_gbm_paths(market, horizon, P, seed=seed)
+        inflation = sample_inflation(market, horizon, P,
+                                      seed=(seed or 0) + 1)
     R = np.stack([returns_by_asset[Asset.STOCK],
                   returns_by_asset[Asset.BOND],
                   returns_by_asset[Asset.CASH]], axis=-1)
