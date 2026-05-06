@@ -22,7 +22,7 @@ computation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Tuple
 
 import numpy as np
@@ -77,6 +77,20 @@ class VState:
     real_balance_by_year: np.ndarray   # (P, H + 1, 3, 3)
     real_contrib_by_year: np.ndarray   # (P, H, 3, 3) — fresh deposits only
 
+    # Rental property (optional). All paths share the same scalar config in
+    # the Scenario; per-path arrays track owned-state + value + debt. When
+    # no rental is configured these are zero-length placeholders.
+    rental_owned: np.ndarray = field(  # (P,) bool
+        default_factory=lambda: np.zeros(0, dtype=bool))
+    rental_value_real: np.ndarray = field(  # (P,) real $
+        default_factory=lambda: np.zeros(0))
+    mortgage_balance_nominal: np.ndarray = field(  # (P,)
+        default_factory=lambda: np.zeros(0))
+    mortgage_payment_nominal: np.ndarray = field(  # (P,) annuity, locked at purchase
+        default_factory=lambda: np.zeros(0))
+    heloc_balance_nominal: np.ndarray = field(  # (P,) drawn-against-equity
+        default_factory=lambda: np.zeros(0))
+
     # ------- constructors -------
 
     @classmethod
@@ -102,6 +116,11 @@ class VState:
             real_shortfall=np.zeros((n_paths, horizon)),
             real_balance_by_year=np.zeros((n_paths, horizon + 1, 3, 3)),
             real_contrib_by_year=np.zeros((n_paths, horizon, 3, 3)),
+            rental_owned=np.zeros(n_paths, dtype=bool),
+            rental_value_real=np.zeros(n_paths),
+            mortgage_balance_nominal=np.zeros(n_paths),
+            mortgage_payment_nominal=np.zeros(n_paths),
+            heloc_balance_nominal=np.zeros(n_paths),
         )
         # Aggregate taxable lots into LT/ST cohorts
         for lot in portfolio.taxable.lots:

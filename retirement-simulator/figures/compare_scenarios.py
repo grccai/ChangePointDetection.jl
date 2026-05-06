@@ -14,6 +14,7 @@ CASES = [
     ("trial",            3_000_000.0, "trial / FIRE=$3.0M"),
     ("trial",            5_000_000.0, "trial / FIRE=$5.0M"),
     ("trial_zero_floor", 2_500_000.0, "zero_floor / FIRE=$2.5M"),
+    ("trial_rental",     2_500_000.0, "rental / FIRE=$2.5M"),
 ]
 
 print(f"{'strategy':<22} {'mode':<28} "

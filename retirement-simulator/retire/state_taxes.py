@@ -114,6 +114,19 @@ WA_2024 = StateTaxYear(
 
 STATES: dict[str, StateTaxYear] = {
     "CA": CA_2024, "OR": OR_2024, "WA": WA_2024,
+    # Texas, Florida, Nevada: no state income tax of any kind.
+    "TX": StateTaxYear(state="TX", year=2024,
+                        ordinary_brackets={"single": [], "mfj": []},
+                        std_deduction={"single": 0.0, "mfj": 0.0},
+                        ltcg_treatment="none"),
+    "FL": StateTaxYear(state="FL", year=2024,
+                        ordinary_brackets={"single": [], "mfj": []},
+                        std_deduction={"single": 0.0, "mfj": 0.0},
+                        ltcg_treatment="none"),
+    "NV": StateTaxYear(state="NV", year=2024,
+                        ordinary_brackets={"single": [], "mfj": []},
+                        std_deduction={"single": 0.0, "mfj": 0.0},
+                        ltcg_treatment="none"),
     "NONE": StateTaxYear(state="NONE", year=2024,
                          ordinary_brackets={"single": [], "mfj": []},
                          std_deduction={"single": 0.0, "mfj": 0.0},

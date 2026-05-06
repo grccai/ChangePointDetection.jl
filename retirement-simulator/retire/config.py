@@ -298,6 +298,63 @@ class Inheritance:
 
 
 @dataclass
+class RentalPurchaseTrigger:
+    """Wealth-conditional purchase policy. Property is bought the first year
+    ALL of these hold AND the property hasn't already been purchased.
+
+    No `max_age` — caller can leave the trigger latent if it never fires.
+    """
+    min_age: float = 0.0                         # earliest age we'd buy
+    min_liquid_real_wealth: float = 0.0          # total real wealth gate
+    min_taxable_real_wealth: float = 0.0         # taxable-only gate so the
+                                                 # downpayment doesn't have to
+                                                 # come from 401k/Roth
+
+
+@dataclass
+class RentalProperty:
+    """Rental property modeled as a separate asset on the balance sheet.
+
+    Mechanics (per path, per year, after `trigger` fires):
+      property_value_real       *= (1 + appreciation_real)
+      noi_real                   = (cap_rate - expense_ratio) * property_value_real
+      mortgage_payment_nominal   = locked annuity payment (fixed at purchase)
+      mortgage_interest_t        = balance_t * rate_n
+      taxable_rental_income      = noi_real - mortgage_interest_real
+                                   (mortgage interest deductible; depreciation
+                                   NOT modelled in v1)
+      net_cash_flow_real         = noi_real - mortgage_payment_real
+                                    - heloc_interest_real
+      after-tax cash             -> deposited to taxable cash sleeve
+
+    Tax sourcing: rental taxable income is taxed by `location_state`
+    (source-based), not residency. Federal tax applies as ordinary.
+
+    Borrow-against-equity (no sale event):
+      accessible_equity = max(0, ltv_max * value_n - mortgage_n - heloc_n)
+      When the simulator would otherwise mark a path failed, draw up to
+      `accessible_equity` from a HELOC at `heloc_rate_nominal` instead.
+      Subsequent years' cash flow services HELOC interest first.
+    """
+    # Purchase economics
+    price_real: float
+    downpayment_frac: float = 0.25
+    mortgage_term_years: int = 30
+    mortgage_nominal_rate: float = 0.07
+    # Operating economics (fractions of property_value_real)
+    cap_rate: float = 0.05
+    expense_ratio: float = 0.02   # maint + insurance + property tax + vacancy
+    appreciation_real: float = 0.005   # excess of CPI
+    # Tax sourcing
+    location_state: str = "CA"
+    # Borrow-against-equity backstop
+    ltv_max: float = 0.80
+    heloc_rate_nominal: float = 0.08
+    # Wealth-conditional purchase trigger
+    trigger: RentalPurchaseTrigger = field(default_factory=RentalPurchaseTrigger)
+
+
+@dataclass
 class Scenario:
     profile: Profile
     state_taxes: StateTimeline
@@ -310,6 +367,7 @@ class Scenario:
     withdrawal: WithdrawalPolicy = field(default_factory=WithdrawalPolicy)
     simulation: SimulationParams = field(default_factory=SimulationParams)
     inheritances: list[Inheritance] = field(default_factory=list)
+    rental_property: RentalProperty | None = None
 
 
 # ---------- YAML helpers ----------
@@ -492,6 +550,28 @@ def load_scenario(path: str | Path) -> Scenario:
             )
         inheritances.append(Inheritance(**kwargs))
 
+    rental = None
+    rp_raw = raw.get("rental_property")
+    if rp_raw is not None:
+        tr = rp_raw.get("trigger", {})
+        rental = RentalProperty(
+            price_real=float(rp_raw["price_real"]),
+            downpayment_frac=float(rp_raw.get("downpayment_frac", 0.25)),
+            mortgage_term_years=int(rp_raw.get("mortgage_term_years", 30)),
+            mortgage_nominal_rate=float(rp_raw.get("mortgage_nominal_rate", 0.07)),
+            cap_rate=float(rp_raw.get("cap_rate", 0.05)),
+            expense_ratio=float(rp_raw.get("expense_ratio", 0.02)),
+            appreciation_real=float(rp_raw.get("appreciation_real", 0.005)),
+            location_state=str(rp_raw.get("location_state", "CA")),
+            ltv_max=float(rp_raw.get("ltv_max", 0.80)),
+            heloc_rate_nominal=float(rp_raw.get("heloc_rate_nominal", 0.08)),
+            trigger=RentalPurchaseTrigger(
+                min_age=float(tr.get("min_age", 0.0)),
+                min_liquid_real_wealth=float(tr.get("min_liquid_real_wealth", 0.0)),
+                min_taxable_real_wealth=float(tr.get("min_taxable_real_wealth", 0.0)),
+            ),
+        )
+
     return Scenario(
         profile=profile, state_taxes=timeline,
         savings=savings, spending=spending,
@@ -499,4 +579,5 @@ def load_scenario(path: str | Path) -> Scenario:
         market=market,
         social_security=ss, withdrawal=wd, simulation=sim,
         inheritances=inheritances,
+        rental_property=rental,
     )

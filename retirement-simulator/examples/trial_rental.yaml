@@ -1,0 +1,168 @@
+# Trial scenario, rental-property variant.
+#
+# 37-year-old single filer, California resident, $240k CA-source wages.
+# Adds a wealth-conditional rental property purchase: when liquid real
+# wealth >= $1.5M and taxable real wealth >= the downpayment + buffer,
+# at age >= 45, buy an $800k property in Texas (no state tax on
+# rental). Held forever; equity is accessible via HELOC backstop.
+#
+# Lots inside taxable account encode the cost-basis structure:
+#   $324k taxable = 90% stock + 10% money market (cash).
+#     Half ($162k) is ST with 100% gain (MV = 2*basis -> basis = MV/2).
+#     Half ($162k) is LT with  80% gain (MV = 1.8*basis -> basis = MV/1.8).
+#     Money-market portion held at full basis (no capital gain on MM funds).
+
+profile:
+  birthdate:        1989-05-05
+  start_date:       2026-05-05
+  retirement_date:  2044-05-05    # age 55 (was 50)
+  end_of_plan_date: 2084-05-05    # age 95
+  filing_status:    single
+
+# Income sources — pieced together so the underlying salary trajectory is
+# continuous at 5%/yr growth from $240k at sim start, with state of
+# employment changing across the WA stint.
+#
+#   Date            Trajectory value (5%/yr from $240k @ 2026-05-05)
+#   2026-08-20      $240k * 1.05^0.293 ≈ $243.5k    (start of WA stint)
+#   2028-12-31      $240k * 1.05^2.660 ≈ $273.4k    (end of WA stint)
+#
+# During the WA stint, total wages split 60% OR / 40% WA. After returning,
+# CA at trajectory ($273k @ 2028-12-31) all the way to retirement at 55.
+income:
+  sources:
+    # 1) CA pre-move
+    - {state: CA, start: 2026-05-05, end: 2026-08-20, gross_annual: 240000, growth_rate: 0.05}
+    # 2) WA stint, 60/40 OR/WA. (Common pattern: live in WA, work in OR.)
+    - {state: OR, start: 2026-08-20, end: 2028-12-31, gross_annual: 146000, growth_rate: 0.05}
+    - {state: WA, start: 2026-08-20, end: 2028-12-31, gross_annual:  97400, growth_rate: 0.05}
+    # 3) Back to CA, picking up the trajectory; ride it all the way to retirement at 55
+    - {state: CA, start: 2028-12-31, end: 2044-05-05, gross_annual: 273400, growth_rate: 0.05}
+
+state_taxes:
+  residency:
+    - {state: CA, start: 2026-05-05, end: 2026-08-20}
+    - {state: WA, start: 2026-08-20, end: 2028-12-31}    # temporary WA move
+    - {state: CA, start: 2028-12-31, end: 2084-05-05}    # back to CA, stay
+
+savings:
+  rate: 0.40
+  contributions:
+    trad_401k: max
+    roth_401k: 0
+    trad_ira: 0
+    roth_ira: 7000              # backdoor implicit at this income
+    mega_backdoor_roth: max     # post-tax 401k -> Roth, up to 415(c) limit
+    # Employer match: 50% on first 6% of pay -> effective 3% of pay.
+    # You contribute >= 6% of pay (max trad 401k on $240k+), so match maxes.
+    employer_match_rate: 0.03
+
+spending:
+  annual_real: 100000           # POST-TAX retirement spending in today's $
+  smile: bengen
+  working_annual_real:  90000   # POST-TAX working-years living budget;
+                                # everything above (taxes + contribs + this)
+                                # flows to taxable savings.
+  flexible:                     # variable-percentage withdrawal in retirement
+    floor_real:        50000    # tight floor through SS-claim (covers FIRE-gap)
+    floor_change_age:  70       # at Social Security claim age...
+    floor_after_real:  80000    # ...the floor lifts back to $80k real
+    sensitivity:       1.0      # 1.0 = full proportional cuts on drawdown
+
+initial_portfolio:
+  taxable:
+    lots:
+      # Stock, 90% of $324k = $291.6k MV total. Split half/half ST/LT.
+      # ST stock: $145.8k MV, 100% gain -> basis = $72.9k. age 0.5 (well under 1y).
+      - {asset: stock, market_value: 145800, cost_basis: 72900, age_years: 0.5}
+      # LT stock: $145.8k MV, 80% gain -> basis = $81k. age 3 (well over 1y).
+      - {asset: stock, market_value: 145800, cost_basis: 81000, age_years: 3.0}
+      # Money market: 10% of $324k = $32.4k. Held at full basis (no cap gain).
+      # Split half/half to match the ST/LT structure for symmetry, but basis = MV.
+      - {asset: cash,  market_value:  16200, cost_basis: 16200, age_years: 0.5}
+      - {asset: cash,  market_value:  16200, cost_basis: 16200, age_years: 3.0}
+  traditional:
+    stock: 136000               # $160k * 0.85
+    bond:   24000               # $160k * 0.15
+    cash:       0
+  roth:
+    stock: 136000
+    bond:   24000
+    cash:       0
+    basis:  80000               # assumed: half of Roth IRA is direct contributions
+
+# Target allocations (current asset mix; optimizer can override).
+target_allocations:
+  taxable:
+    stock: 0.90
+    bond:  0.00
+    cash:  0.10
+  traditional:
+    stock: 0.85
+    bond:  0.15
+    cash:  0.00
+  roth:
+    stock: 0.85
+    bond:  0.15
+    cash:  0.00
+
+market:
+  stocks: {real_return: 0.06, vol: 0.18}
+  bonds:  {real_return: 0.02, vol: 0.06}
+  cash:   {real_return: 0.005, vol: 0.01}
+  inflation_mean: 0.025
+  inflation_vol: 0.0
+  correlation_stock_bond: 0.10
+  correlation_stock_cash: 0.0
+  correlation_bond_cash: 0.0
+
+social_security:
+  # PIA computed from earnings history:
+  #   2011-2021 @ $160k, 2022-2025 @ $225k, 2026+ @ trial-scenario trajectory.
+  #   AIME (in 2024$) = $13,541/mo  -> PIA at FRA(67) = $3,915/mo.
+  # Claim age 70 (124% of PIA) wins on failure-rate + CVaR criterion.
+  monthly_at_67: 4855           # = PIA * 1.24 (delayed retirement credits to 70)
+  claim_age:     70
+
+withdrawal:
+  strategy: tax_aware
+  roth_conversion_target_bracket: 0.12
+  aca_magi_cap: 50000
+
+simulation:
+  n_paths: 5000
+  seed: 42
+  return_model: gbm
+
+# One-time inheritance(s). Amount is in TODAY'S dollars; converted to
+# nominal at the date using realised cumulative inflation. Estate tax not
+# modelled — `amount_real` is the net received.
+inheritances:
+  # Benefactor currently age 65 (born ~1961). Each MC path samples its own
+  # arrival year from a Gompertz hazard tuned to a healthy 65yo (qx(65)≈0.5%,
+  # median age at death ≈ 92). Paths where the benefactor outlives the
+  # plan horizon (to ~ user age 95 = benefactor age 123) get no inheritance.
+  - amount_real: 1000000
+    account: taxable
+    hazard:
+      profile: healthy_65
+      current_age: 65
+
+# Rental property: wealth-conditional purchase, no sale, equity acts as a
+# HELOC backstop for ruin avoidance. Cash flow is taxed as ordinary
+# income sourced to `location_state` (here Texas — no state tax).
+rental_property:
+  price_real:           800000   # today's $ purchase price
+  downpayment_frac:     0.25     # 25% down -> $200k equity, $600k loan
+  mortgage_term_years:  30
+  mortgage_nominal_rate: 0.07    # 7% nominal -> ~4.4% real at 2.5% CPI
+  cap_rate:             0.06     # gross rent / value
+  expense_ratio:        0.025    # maint + ins + property tax + vacancy
+  appreciation_real:    0.005    # 0.5%/yr real appreciation (CPI+0.5%)
+  location_state:       TX       # source state for rental income tax
+  ltv_max:              0.80     # HELOC capacity = 80% LTV - debt
+  heloc_rate_nominal:   0.08     # backstop draw rate
+  trigger:
+    min_age:                  45        # no purchase before age 45
+    min_liquid_real_wealth:   1500000   # need $1.5M real to consider
+    min_taxable_real_wealth:  300000    # downpayment + buffer in taxable

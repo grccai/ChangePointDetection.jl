@@ -25,6 +25,7 @@ from .returns import (sample_gbm_paths, sample_inflation,
                       sample_historical_paths,
                       sample_historical_ath_paths,
                       sample_historical_stretched_ath_paths)
+from . import rental as _rental
 from .state_taxes import (StateTimeline, state_tax_vec, state_wages_tax,
                           state_residency_tax_vec)
 from .taxes import (TAX_2024, TaxYear, FilingStatus, Bracket,
@@ -338,6 +339,30 @@ def simulate(scn: Scenario,
             if mask.any():
                 _deposit_inheritance(s, scn, inh, y, mask)
 
+        # ---- rental property purchase trigger ----
+        # Fired before the year's policy query so the policy sees the
+        # post-purchase taxable balance. Cap gains from the downpayment
+        # withdrawal are taxed in the same year as a separate adjustment.
+        if scn.rental_property is not None:
+            rp = scn.rental_property
+            liquid_real = s.real_wealth[:, y]
+            taxable_real = s.taxable_total() / s.cumulative_inflation
+            buyers = _rental.trigger_fires(s, rp, age, liquid_real, taxable_real)
+            if buyers.any():
+                dp_real = _rental.execute_purchase(s, rp, buyers, y)
+                dp_n = dp_real * s.cumulative_inflation
+                _proc, lt_g, st_g = withdraw_taxable_for_spending(s, dp_n)
+                # Marginal cap-gains tax on the purchase-driven sale. Apply
+                # at year-end below by stashing in pending arrays.
+                rental_purchase_lt_gain_n = lt_g
+                rental_purchase_st_gain_n = st_g
+            else:
+                rental_purchase_lt_gain_n = np.zeros(P)
+                rental_purchase_st_gain_n = np.zeros(P)
+        else:
+            rental_purchase_lt_gain_n = np.zeros(P)
+            rental_purchase_st_gain_n = np.zeros(P)
+
         # ---- query policy with current state summary ----
         if y == 0:
             median_real_w = float(s.real_wealth[:, 0].mean())
@@ -381,11 +406,84 @@ def simulate(scn: Scenario,
             _step_decumulation(s, scn, age, y, ret_y, fs, timeline,
                                targets_taxable, targets_trad, targets_roth, yf,
                                decision)
+
+        # ---- rental property: annual operating step ----
+        if scn.rental_property is not None and s.rental_owned.any():
+            rp = scn.rental_property
+            (rental_taxable_real, rental_net_cash_real,
+             _interest_real) = _rental.step_rental_year(s, rp)
+            # Rental tax: Federal ordinary on rental_taxable_income; state
+            # is sourced to the property's location_state regardless of
+            # residency.
+            rental_taxable_n = rental_taxable_real * s.cumulative_inflation
+            # Stack rental income on top of zero baseline for the marginal
+            # tax (approximation — full bracket effect would require
+            # recomputing the year's federal/state tax with rental folded in).
+            fed_rent_tax, _ = _federal_tax_vec(
+                rental_taxable_n,
+                np.zeros(P), np.zeros(P), fs)
+            state_rent_tax = state_tax_vec(
+                state=rp.location_state,
+                ordinary_income=rental_taxable_n,
+                ltcg_income=np.zeros(P),
+                filing_status=fs)
+            # Cap-gains tax on the purchase sale (this year only)
+            cg_fed_tax = np.zeros(P)
+            cg_state_tax = np.zeros(P)
+            if (rental_purchase_lt_gain_n.any()
+                    or rental_purchase_st_gain_n.any()):
+                _, cg_fed_tax = _federal_tax_vec(
+                    np.zeros(P),
+                    rental_purchase_lt_gain_n,
+                    rental_purchase_st_gain_n, fs)
+                # Residency-weighted, since cap gains are residency-sourced
+                # (the seller still lives wherever they live)
+                residency_w = timeline.residency_weights(sim_start, y)
+                cg_state_tax = state_residency_tax_vec(
+                    residency_weights=residency_w,
+                    ordinary_other=rental_purchase_st_gain_n,
+                    ltcg=rental_purchase_lt_gain_n,
+                    filing_status=fs)
+            rental_total_tax_n = (fed_rent_tax + state_rent_tax
+                                   + cg_fed_tax + cg_state_tax)
+            rental_total_tax_real = rental_total_tax_n / s.cumulative_inflation
+
+            # Post-tax cash flow into / out of taxable cash sleeve
+            post_tax_real = rental_net_cash_real - rental_total_tax_real
+            post_tax_n = post_tax_real * s.cumulative_inflation
+            # If positive, deposit to taxable cash; first try to repay HELOC
+            pos = np.maximum(0.0, post_tax_real)
+            if pos.any():
+                applied_repay = _rental.repay_heloc_real(s, pos)
+                deposit_real = pos - applied_repay
+                deposit_n = deposit_real * s.cumulative_inflation
+                deposit_taxable_st(s, ASSET_IDX[Asset.CASH], deposit_n)
+            # If negative, debit taxable cash; backstop with HELOC
+            neg_real = np.maximum(0.0, -post_tax_real)
+            if neg_real.any():
+                neg_n = neg_real * s.cumulative_inflation
+                _proc, lt_g, st_g = withdraw_taxable_for_spending(s, neg_n)
+                # Any unfunded shortfall draws on HELOC up to capacity
+                still_short_n = neg_n - _proc
+                still_short_real = still_short_n / s.cumulative_inflation
+                if (still_short_real > 0).any():
+                    _rental.draw_heloc_real(s, still_short_real, rp)
+
+            # Record total rental tax in the year's tax bucket
+            s.real_taxes[:, y] += rental_total_tax_real
+
         s.age_st_to_lt()
         s.real_wealth[:, y + 1] = s.total_value() / s.cumulative_inflation
         _record_balances(s, year_idx=y + 1)
         if age >= retirement_age:
-            s.failed |= (s.total_value() <= 0)
+            # Ruin: taxable+401k+roth all depleted AND no HELOC capacity left.
+            # When rental is configured, the equity backstop softens ruin.
+            tot = s.total_value()
+            if scn.rental_property is not None and s.rental_owned.any():
+                eq_real = _rental.accessible_equity_real(s, scn.rental_property)
+                eq_n = eq_real * s.cumulative_inflation
+                tot = tot + eq_n
+            s.failed |= (tot <= 0)
 
     # Build per-path PathResult objects from arrays
     paths: list[PathResult] = []
