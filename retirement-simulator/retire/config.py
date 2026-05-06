@@ -316,8 +316,12 @@ class RentalProperty:
     """Rental property modeled as a separate asset on the balance sheet.
 
     Mechanics (per path, per year, after `trigger` fires):
-      property_value_real       *= (1 + appreciation_real)
-      noi_real                   = (cap_rate - expense_ratio) * property_value_real
+      property_return            ~ correlated lognormal w/ stock & bond
+                                   log-returns this year (rho_s, rho_b)
+      property_value_real       *= (1 + property_return)
+      rent_shock                ~ N(0, rent_shock_vol)   per year
+      noi_real                   = (cap_rate * (1 + rent_shock)
+                                    - expense_ratio) * property_value_real
       mortgage_payment_nominal   = locked annuity payment (fixed at purchase)
       mortgage_interest_t        = balance_t * rate_n
       taxable_rental_income      = noi_real - mortgage_interest_real
@@ -344,7 +348,13 @@ class RentalProperty:
     # Operating economics (fractions of property_value_real)
     cap_rate: float = 0.05
     expense_ratio: float = 0.02   # maint + insurance + property tax + vacancy
-    appreciation_real: float = 0.005   # excess of CPI
+    rent_shock_vol: float = 0.05  # annual stdev of multiplicative rent shock
+    # Property appreciation (excess of CPI), stochastic, correlated with stock
+    # and bond log-returns.
+    appreciation_real_mean: float = 0.005   # excess of CPI
+    appreciation_real_vol: float = 0.10     # annual stdev (real)
+    correlation_with_stock: float = 0.30    # contemporaneous log-return corr
+    correlation_with_bond: float = 0.10     # ditto
     # Tax sourcing
     location_state: str = "CA"
     # Borrow-against-equity backstop
@@ -554,6 +564,10 @@ def load_scenario(path: str | Path) -> Scenario:
     rp_raw = raw.get("rental_property")
     if rp_raw is not None:
         tr = rp_raw.get("trigger", {})
+        # Backward-compatibility: accept the old `appreciation_real` scalar
+        # as the new `appreciation_real_mean` (deterministic if no _vol set).
+        appr_mean = float(rp_raw.get("appreciation_real_mean",
+                                       rp_raw.get("appreciation_real", 0.005)))
         rental = RentalProperty(
             price_real=float(rp_raw["price_real"]),
             downpayment_frac=float(rp_raw.get("downpayment_frac", 0.25)),
@@ -561,7 +575,11 @@ def load_scenario(path: str | Path) -> Scenario:
             mortgage_nominal_rate=float(rp_raw.get("mortgage_nominal_rate", 0.07)),
             cap_rate=float(rp_raw.get("cap_rate", 0.05)),
             expense_ratio=float(rp_raw.get("expense_ratio", 0.02)),
-            appreciation_real=float(rp_raw.get("appreciation_real", 0.005)),
+            rent_shock_vol=float(rp_raw.get("rent_shock_vol", 0.05)),
+            appreciation_real_mean=appr_mean,
+            appreciation_real_vol=float(rp_raw.get("appreciation_real_vol", 0.10)),
+            correlation_with_stock=float(rp_raw.get("correlation_with_stock", 0.30)),
+            correlation_with_bond=float(rp_raw.get("correlation_with_bond", 0.10)),
             location_state=str(rp_raw.get("location_state", "CA")),
             ltv_max=float(rp_raw.get("ltv_max", 0.80)),
             heloc_rate_nominal=float(rp_raw.get("heloc_rate_nominal", 0.08)),

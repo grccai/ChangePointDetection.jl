@@ -281,6 +281,16 @@ def simulate(scn: Scenario,
                   returns_by_asset[Asset.BOND],
                   returns_by_asset[Asset.CASH]], axis=-1)
 
+    # Pre-sample correlated property returns + rent shocks. Both are (P, H)
+    # arrays; they're indexed once per year inside the main loop below.
+    if scn.rental_property is not None:
+        property_returns_real, rent_shocks = _rental.sample_rental_paths(
+            R, scn.market, scn.rental_property,
+            seed=(seed or 0) + 7919)
+    else:
+        property_returns_real = None
+        rent_shocks = None
+
     starting_wages = scn.state_taxes.total_wages(scn.profile.start_date, 0)
     s = VState.from_portfolio(scn.initial_portfolio, P, horizon,
                               starting_nominal_income=starting_wages)
@@ -411,8 +421,14 @@ def simulate(scn: Scenario,
         # ---- rental property: annual operating step ----
         if scn.rental_property is not None and s.rental_owned.any():
             rp = scn.rental_property
+            pr_y = (property_returns_real[:, y]
+                    if property_returns_real is not None else None)
+            rs_y = (rent_shocks[:, y]
+                    if rent_shocks is not None else None)
             (rental_taxable_real, rental_net_cash_real,
-             _interest_real) = _rental.step_rental_year(s, rp)
+             _interest_real) = _rental.step_rental_year(s, rp,
+                                                          property_return_real=pr_y,
+                                                          rent_shock=rs_y)
             # Rental tax: Federal ordinary on rental_taxable_income; state
             # is sourced to the property's location_state regardless of
             # residency.

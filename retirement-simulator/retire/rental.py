@@ -25,8 +25,66 @@ from __future__ import annotations
 
 import numpy as np
 
-from .config import RentalProperty
+from .accounts import Asset
+from .config import MarketConfig, RentalProperty
 from .vstate import VState
+
+
+def sample_rental_paths(R: np.ndarray, market: MarketConfig,
+                         rp: RentalProperty,
+                         seed: int | None = None
+                         ) -> tuple[np.ndarray, np.ndarray]:
+    """Sample (P, H) annual real property returns + (P, H) rent shocks.
+
+    Property log-return is correlated with stock and bond log returns:
+      z_stock, z_bond = standardized log-returns (using GBM-implied
+                        moments — works for both GBM and historical
+                        bootstrap, where realised log returns are folded
+                        in directly)
+      log_property = mu_p_log + sd_p_log * (rho_s * z_s + rho_b * z_b
+                                              + sqrt(...) * z_indep)
+    Variance of the convex combination is normalised to 1 using the
+    stock-bond correlation (`rho_sb`) from MarketConfig.
+
+    Rent shock is independent N(0, rent_shock_vol) per (path, year).
+    """
+    P, H, _ = R.shape
+    eps = 1e-9
+    rng = np.random.default_rng(seed)
+    log_s = np.log(np.maximum(eps, 1.0 + R[:, :, 0]))
+    log_b = np.log(np.maximum(eps, 1.0 + R[:, :, 1]))
+    # GBM-implied log moments for standardisation
+    from .returns import _arith_to_log
+    mu_s_log, sd_s_log = _arith_to_log(market.stocks.real_return,
+                                         market.stocks.vol)
+    mu_b_log, sd_b_log = _arith_to_log(market.bonds.real_return,
+                                         market.bonds.vol)
+    sd_s_log = max(eps, sd_s_log)
+    sd_b_log = max(eps, sd_b_log)
+    z_s = (log_s - mu_s_log) / sd_s_log
+    z_b = (log_b - mu_b_log) / sd_b_log
+    rho_s = float(rp.correlation_with_stock)
+    rho_b = float(rp.correlation_with_bond)
+    rho_sb = float(market.correlation_stock_bond)
+    cross = 2.0 * rho_s * rho_b * rho_sb
+    var_indep = 1.0 - rho_s ** 2 - rho_b ** 2 - cross
+    if var_indep < 1e-6:
+        # Shrink toward feasibility while preserving sign + ratio
+        denom = (rho_s ** 2 + rho_b ** 2 + abs(cross)) or 1.0
+        scale = float(np.sqrt(max(0.0, (1.0 - 1e-3) / denom)))
+        rho_s *= scale
+        rho_b *= scale
+        cross = 2.0 * rho_s * rho_b * rho_sb
+        var_indep = max(1e-6, 1.0 - rho_s ** 2 - rho_b ** 2 - cross)
+    z_indep = rng.standard_normal((P, H))
+    z_p = rho_s * z_s + rho_b * z_b + np.sqrt(var_indep) * z_indep
+    mu_p_log, sd_p_log = _arith_to_log(rp.appreciation_real_mean,
+                                          max(eps, rp.appreciation_real_vol))
+    log_p = mu_p_log + sd_p_log * z_p
+    arith_p = np.exp(log_p) - 1.0
+
+    rent_shocks = rng.normal(0.0, max(0.0, rp.rent_shock_vol), size=(P, H))
+    return arith_p, rent_shocks
 
 
 def annuity_payment_nominal(loan_n: np.ndarray, rate: float,
@@ -87,10 +145,17 @@ def execute_purchase(s: VState, rp: RentalProperty,
     return dp_real
 
 
-def step_rental_year(s: VState, rp: RentalProperty
+def step_rental_year(s: VState, rp: RentalProperty,
+                     property_return_real: np.ndarray | None = None,
+                     rent_shock: np.ndarray | None = None,
                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Advance rental property by one year, in-place mutation of mortgage
     + heloc balances + property value.
+
+    `property_return_real` and `rent_shock` are (P,) arrays sampled by the
+    caller (see `sample_rental_paths` in this module). If omitted, the
+    property step is deterministic (return = appreciation_real_mean,
+    no rent shock).
 
     Returns three (P,) arrays in REAL dollars (zeros for non-owners):
       taxable_rental_income_real :  NOI - mortgage_interest (Schedule-E)
@@ -109,10 +174,14 @@ def step_rental_year(s: VState, rp: RentalProperty
     cum_infl = s.cumulative_inflation
     zeros = np.zeros(P)
 
-    # Property appreciation (real)
+    # Property appreciation (real). Draw from sampled returns if provided.
+    if property_return_real is None:
+        ret_real = np.full(P, rp.appreciation_real_mean)
+    else:
+        ret_real = property_return_real
     s.rental_value_real = np.where(
         owned,
-        s.rental_value_real * (1.0 + rp.appreciation_real),
+        s.rental_value_real * (1.0 + ret_real),
         s.rental_value_real,
     )
 
@@ -143,9 +212,13 @@ def step_rental_year(s: VState, rp: RentalProperty
     interest_real = interest_n / cum_infl
     payment_real = pay_n / cum_infl
     heloc_int_real = heloc_int_n / cum_infl
+    if rent_shock is None:
+        cap_eff = rp.cap_rate
+    else:
+        cap_eff = rp.cap_rate * (1.0 + rent_shock)
     noi_real = np.where(
         owned,
-        (rp.cap_rate - rp.expense_ratio) * s.rental_value_real,
+        (cap_eff - rp.expense_ratio) * s.rental_value_real,
         zeros,
     )
     net_cash_flow_real = noi_real - payment_real - heloc_int_real

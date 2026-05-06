@@ -156,9 +156,14 @@ rental_property:
   downpayment_frac:     0.25     # 25% down -> $200k equity, $600k loan
   mortgage_term_years:  30
   mortgage_nominal_rate: 0.07    # 7% nominal -> ~4.4% real at 2.5% CPI
-  cap_rate:             0.06     # gross rent / value
+  cap_rate:             0.06     # gross rent / value (mean)
   expense_ratio:        0.025    # maint + ins + property tax + vacancy
-  appreciation_real:    0.005    # 0.5%/yr real appreciation (CPI+0.5%)
+  rent_shock_vol:       0.07     # annual stdev of rent multiplier (vacancy)
+  # Stochastic appreciation, correlated with stock & bond log returns.
+  appreciation_real_mean: 0.005  # 0.5%/yr real appreciation (CPI+0.5%)
+  appreciation_real_vol:  0.10   # 10% annual stdev (Case-Shiller-ish)
+  correlation_with_stock: 0.30   # contemporaneous log-return corr
+  correlation_with_bond:  0.10
   location_state:       TX       # source state for rental income tax
   ltv_max:              0.80     # HELOC capacity = 80% LTV - debt
   heloc_rate_nominal:   0.08     # backstop draw rate
