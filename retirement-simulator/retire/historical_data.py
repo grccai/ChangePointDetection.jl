@@ -136,3 +136,27 @@ def real_returns() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
             (1 + STOCK_NOMINAL) / deflator - 1,
             (1 + BOND_NOMINAL)  / deflator - 1,
             (1 + CASH_NOMINAL)  / deflator - 1)
+
+
+def ath_real_total_return_indicator() -> np.ndarray:
+    """Boolean array, True for years where the cumulative real total
+    stock return reached a new all-time high. Used by the
+    `historical_ath` return mode to condition bootstrap starts on the
+    "today markets are at ATH" situation.
+
+    Note that under this rule, *most years in long bull cycles count as
+    ATH* (1950s-60s, 1980s-90s, 2010s-20s) since each new year's gain
+    pushes to a fresh real-total-return high. ATH is NOT synonymous with
+    "right before a crash" — it means "the trailing-cumulative real total
+    return for stocks is at a fresh high." That said, ATH starts do
+    include 1928, 1937, 1965-66, 1968, 1972 from the in-sample data —
+    several of which preceded major drawdowns."""
+    yrs, stock, _, _ = real_returns()
+    cum = np.cumprod(1.0 + stock)
+    running_max = -np.inf
+    is_ath = np.zeros(len(yrs), dtype=bool)
+    for i in range(len(yrs)):
+        if cum[i] > running_max:
+            is_ath[i] = True
+            running_max = cum[i]
+    return is_ath

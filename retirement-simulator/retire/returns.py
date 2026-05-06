@@ -188,3 +188,40 @@ def sample_historical_paths(n_years: int, n_paths: int,
              Asset.BOND:  samples[..., 1],
              Asset.CASH:  samples[..., 2]},
             samples[..., 3])
+
+
+def sample_historical_ath_paths(n_years: int, n_paths: int,
+                                 seed: int | None = None
+                                 ) -> tuple[dict[Asset, np.ndarray], np.ndarray]:
+    """Bootstrap that conditions the start year on stocks being at a real
+    all-time-total-return high. Models the situation 'today markets are at
+    ATH; what's the conditional forward distribution over the next H years?'
+
+    Each path picks a uniformly-random start from the set of valid ATH
+    years (where year + n_years still fits in the dataset) and uses the
+    H consecutive years from that start. No block bootstrap — preserves
+    the FULL CONTIGUOUS HISTORICAL SEQUENCE from the chosen start, which
+    is the right thing for capturing post-ATH regime dynamics.
+
+    For 1928-2023 with H=58, there are typically ~15 valid ATH starts —
+    smaller sample than the unrestricted bootstrap (~39 valid starts), so
+    the resulting MC has slightly higher between-bootstrap variance."""
+    from . import historical_data as hd
+    years, stock, bond, cash = hd.real_returns()
+    infl = hd.INFLATION
+    history = np.stack([stock, bond, cash, infl], axis=-1)   # (T, 4)
+    is_ath = hd.ath_real_total_return_indicator()
+    T = len(years)
+    valid = np.where(is_ath & (np.arange(T) + n_years <= T))[0]
+    if len(valid) == 0:
+        # No ATH start fits the horizon — fall back to unrestricted bootstrap.
+        return sample_historical_paths(n_years, n_paths, seed=seed)
+    rng = np.random.default_rng(seed)
+    starts = rng.choice(valid, size=n_paths, replace=True)
+    out = np.empty((n_paths, n_years, 4))
+    for p, s in enumerate(starts):
+        out[p] = history[s:s + n_years]
+    return ({Asset.STOCK: out[..., 0],
+             Asset.BOND:  out[..., 1],
+             Asset.CASH:  out[..., 2]},
+            out[..., 3])

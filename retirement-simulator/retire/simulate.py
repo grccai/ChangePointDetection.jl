@@ -22,7 +22,8 @@ from .policy import (Policy, StaticPolicy, Decision, StateSummary)
 from .returns import (sample_gbm_paths, sample_inflation,
                       sample_deterministic_paths,
                       sample_deterministic_inflation,
-                      sample_historical_paths)
+                      sample_historical_paths,
+                      sample_historical_ath_paths)
 from .state_taxes import (StateTimeline, state_tax_vec, state_wages_tax,
                           state_residency_tax_vec)
 from .taxes import (TAX_2024, TaxYear, FilingStatus, Bracket,
@@ -262,6 +263,9 @@ def simulate(scn: Scenario,
     elif return_model in ("historical", "bootstrap"):
         returns_by_asset, inflation = sample_historical_paths(
             n_years=horizon, n_paths=P, seed=seed, block_size=1)
+    elif return_model == "historical_ath":
+        returns_by_asset, inflation = sample_historical_ath_paths(
+            n_years=horizon, n_paths=P, seed=seed)
     else:
         # gbm (default)
         returns_by_asset = sample_gbm_paths(market, horizon, P, seed=seed)
