@@ -711,3 +711,79 @@ BODIE_MERTON_PARAM_BOUNDS: list[tuple[float, float]] = [
     (0.0, 5.0),      # conv SS-window idx
     (0.0, 1.0),      # trad split
 ]
+
+
+# ---------- Multi-phase dynamic policy ----------
+
+@dataclass
+class MultiPhasePolicy:
+    """Dispatches to one of three sub-policies based on a state-AND-age rule:
+
+      Phase 1 (accumulation):    median_real_wealth < fire_target  AND
+                                 age < retirement_age              ← both required
+      Phase 2 (barista FIRE):    above is False, AND age < phase3_start_age
+      Phase 3 (full retirement): age >= phase3_start_age
+
+    Phase 1 → Phase 2 triggers when EITHER wealth crosses the FIRE target
+    OR the user reaches retirement_age (whichever happens first). The
+    transition is **latching** — once we leave Phase 1 we don't go back,
+    even if a market drawdown pulls median wealth below FIRE again. This
+    matches the natural narrative ("once you've hit your number, you're
+    barista-FIRE").
+
+    Phase boundary uses cross-path median wealth (consistent with the
+    median-path-policy architecture); the same dispatch is applied to all
+    paths each year."""
+    phase1: Policy
+    phase2: Policy
+    phase3: Policy
+    retirement_age: float
+    phase3_start_age: float
+    _past_phase_1: bool = field(default=False, init=False)
+
+    def decide(self, ss: StateSummary) -> Decision:
+        if not self._past_phase_1:
+            if (ss.median_real_wealth < ss.fire_target_real
+                    and ss.age < self.retirement_age):
+                return self.phase1.decide(ss)
+            # First time we've hit either trigger — latch in.
+            self._past_phase_1 = True
+        if ss.age < self.phase3_start_age:
+            return self.phase2.decide(ss)
+        return self.phase3.decide(ss)
+
+
+def build_multi_phase_policy(x: list[float] | tuple[float, ...],
+                              scn,
+                              retirement_age: float, ss_age: float = 67.0,
+                              rmd_age: float = 73.0,
+                              phase3_start_age: float | None = None
+                              ) -> MultiPhasePolicy:
+    """Concatenated parameter vector, length 23:
+        [0..5]    Phase 1 BodieMerton (6 params)
+        [6..14]   Phase 2 BondTent    (9 params)
+        [15..22]  Phase 3 CPPI        (8 params)
+    Phase 1 → Phase 2 triggers when median wealth >= FIRE_target OR age
+    reaches retirement_age. Phase 2 → Phase 3 triggers at `phase3_start_age`
+    (default = ss_age, the start of Social Security)."""
+    if len(x) != 23:
+        raise ValueError(f"expected 23 params for multi_phase, got {len(x)}")
+    if phase3_start_age is None:
+        phase3_start_age = ss_age
+    p1 = build_bodie_merton_policy(x[:6], scn=scn,
+                                    retirement_age=retirement_age, ss_age=ss_age,
+                                    rmd_age=rmd_age)
+    p2 = build_bond_tent_policy(x[6:15], retirement_age=retirement_age,
+                                 ss_age=ss_age, rmd_age=rmd_age)
+    p3 = build_cppi_policy(x[15:23], retirement_age=retirement_age,
+                            ss_age=ss_age, rmd_age=rmd_age)
+    return MultiPhasePolicy(
+        phase1=p1, phase2=p2, phase3=p3,
+        retirement_age=retirement_age,
+        phase3_start_age=phase3_start_age,
+    )
+
+
+MULTI_PHASE_PARAM_BOUNDS: list[tuple[float, float]] = (
+    BODIE_MERTON_PARAM_BOUNDS + BOND_TENT_PARAM_BOUNDS + CPPI_PARAM_BOUNDS
+)

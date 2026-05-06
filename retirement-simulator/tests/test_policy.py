@@ -258,6 +258,64 @@ def test_bodie_merton_param_bounds_length():
     assert len(BODIE_MERTON_PARAM_BOUNDS) == 6
 
 
+def test_multi_phase_latches_on_fire_target():
+    """Multi-phase policy: once median wealth crosses fire_target OR age
+    reaches retirement_age, transition to phase 2 latches."""
+    import os
+    from retire.config import load_scenario
+    from retire.policy import build_multi_phase_policy
+    yaml_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "examples", "trial.yaml")
+    scn = load_scenario(yaml_path)
+    # Build with arbitrary param vector
+    x = ([3.0, 0.03, 0.05, 0.0, 2.0, 1.0]                # phase 1 BodieMerton
+         + [0.95, 0.30, -5.0, 8.0, 0.05, 0.0, 2.0, 1.0, 0.5]   # phase 2 BondTent
+         + [0.5, 0.0, 3.0, 1.0, 0.05, 0.0, 4.0, 1.0])    # phase 3 CPPI
+    pol = build_multi_phase_policy(x, scn=scn,
+                                     retirement_age=scn.profile.retirement_age,
+                                     ss_age=70.0)
+    # Pre-FIRE, working age: phase 1
+    ss_pre = _ss(age=40, year_idx=3, wealth=1_000_000, target=2_500_000)
+    pol.decide(ss_pre)
+    assert pol._past_phase_1 is False
+    # Cross FIRE target
+    ss_fire = _ss(age=42, year_idx=5, wealth=2_600_000, target=2_500_000)
+    pol.decide(ss_fire)
+    assert pol._past_phase_1 is True
+    # Wealth drops back below: still in phase 2 (latched)
+    ss_drop = _ss(age=43, year_idx=6, wealth=1_500_000, target=2_500_000)
+    pol.decide(ss_drop)
+    assert pol._past_phase_1 is True
+
+
+def test_multi_phase_latches_on_retirement_age():
+    """Without ever reaching FIRE, hitting retirement_age also transitions."""
+    import os
+    from retire.config import load_scenario
+    from retire.policy import build_multi_phase_policy
+    yaml_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "examples", "trial.yaml")
+    scn = load_scenario(yaml_path)
+    x = ([3.0, 0.03, 0.05, 0.0, 2.0, 1.0]
+         + [0.95, 0.30, -5.0, 8.0, 0.05, 0.0, 2.0, 1.0, 0.5]
+         + [0.5, 0.0, 3.0, 1.0, 0.05, 0.0, 4.0, 1.0])
+    ret_age = scn.profile.retirement_age
+    pol = build_multi_phase_policy(x, scn=scn,
+                                     retirement_age=ret_age, ss_age=70.0)
+    # Pre-retirement, never reached FIRE: phase 1
+    ss = _ss(age=ret_age - 1, year_idx=int(ret_age - 38),
+             wealth=1_500_000, target=2_500_000)
+    pol.decide(ss)
+    assert pol._past_phase_1 is False
+    # At retirement age, still no FIRE: latches in
+    ss = _ss(age=ret_age, year_idx=int(ret_age - 37),
+             wealth=1_500_000, target=2_500_000)
+    pol.decide(ss)
+    assert pol._past_phase_1 is True
+
+
 def test_three_knot_glide_decoder():
     from retire.policy import (build_three_knot_glide_policy,
                                 THREE_KNOT_GLIDE_PARAM_BOUNDS)

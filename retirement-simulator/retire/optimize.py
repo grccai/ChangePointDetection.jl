@@ -45,7 +45,8 @@ from .policy import (Policy, StaticPolicy, GlidePolicy,
                      build_bond_tent_policy, BOND_TENT_PARAM_BOUNDS,
                      build_cppi_policy, CPPI_PARAM_BOUNDS,
                      build_bodie_merton_policy,
-                     BODIE_MERTON_PARAM_BOUNDS)
+                     BODIE_MERTON_PARAM_BOUNDS,
+                     build_multi_phase_policy, MULTI_PHASE_PARAM_BOUNDS)
 from .simulate import simulate, SimResult
 
 
@@ -88,6 +89,16 @@ class OptimizerConfig:
     fire_target_real: float | None = None    # default: 25 * scn.spending.annual_real
     fire_age: int | None = None              # default: scn.profile.retirement_age
     ruin_max: float = 0.01                   # 1% by default for fire_prob
+    # Search algorithm:
+    #   'differential_evolution' : default, scipy.optimize.differential_evolution
+    #   'cma_es'                 : Hansen et al. CMA-ES via the cma package
+    #   'bipop_cma_es'           : BIPOP-restart CMA-ES; better for noisy /
+    #                              multimodal objectives, often outperforms DE
+    #                              on 10-50-dim continuous problems.
+    algorithm: str = "differential_evolution"
+    # Total evaluation budget cap (only used by cma/bipop_cma; DE uses
+    # popsize x maxiter x ndim from its own logic).
+    max_evals: int | None = None
 
 
 def _alloc(s: float, b: float) -> Allocation:
@@ -165,6 +176,10 @@ def _build_policy(x: np.ndarray, scn_base: Scenario,
             list(x), retirement_age=retirement_age, ss_age=ss_age)
     if cfg.policy_class == "bodie_merton":
         return build_bodie_merton_policy(
+            list(x), scn=scn_base,
+            retirement_age=retirement_age, ss_age=ss_age)
+    if cfg.policy_class == "multi_phase":
+        return build_multi_phase_policy(
             list(x), scn=scn_base,
             retirement_age=retirement_age, ss_age=ss_age)
     # static
@@ -329,6 +344,91 @@ def _objective_for(scn_base: Scenario, cfg: OptimizerConfig):
     )
 
 
+@dataclass
+class _SearchResult:
+    """Adapter mimicking scipy's OptimizeResult for downstream code."""
+    x: np.ndarray
+    fun: float
+    nit: int
+    nfev: int
+    message: str = ""
+
+
+def _run_search(obj, bounds, cfg: OptimizerConfig) -> _SearchResult:
+    """Dispatch on cfg.algorithm. Returns a _SearchResult-ish object with
+    .x, .fun, .nit, .nfev, .message."""
+    n = len(bounds)
+    lo = np.array([b[0] for b in bounds])
+    hi = np.array([b[1] for b in bounds])
+
+    if cfg.algorithm == "differential_evolution":
+        res = differential_evolution(
+            obj, bounds=bounds, seed=cfg.seed, maxiter=cfg.maxiter,
+            popsize=cfg.popsize, workers=cfg.workers, polish=cfg.polish,
+            tol=1e-3, mutation=(0.5, 1.0), recombination=0.7,
+            init="sobol",
+            updating="deferred" if cfg.workers != 1 else "immediate",
+        )
+        return _SearchResult(x=res.x, fun=float(res.fun),
+                              nit=int(res.nit), nfev=int(res.nfev),
+                              message=str(res.message))
+
+    if cfg.algorithm in ("cma_es", "bipop_cma_es"):
+        try:
+            import cma
+        except ImportError as e:
+            raise RuntimeError("Install the `cma` package for CMA-ES") from e
+        # Box constraints via cma's bounds; rescale to roughly [0,10] range
+        # so the unit-sigma works across heterogeneous parameter scales.
+        scale = np.where(hi > lo, hi - lo, 1.0)
+        # Initial guess: midpoint
+        x0_real = (lo + hi) / 2.0
+        x0_norm = (x0_real - lo) / scale  # in [0, 1]
+        sigma0 = 0.25  # spans most of [0,1] in two sigma
+
+        def obj_norm(z):
+            # decode normalised z in [0,1] back to real bounds
+            x = lo + np.clip(z, 0.0, 1.0) * scale
+            return obj(x)
+
+        budget = cfg.max_evals or (cfg.popsize * cfg.maxiter * n)
+        opts = {
+            "bounds": [[0.0] * n, [1.0] * n],
+            "maxfevals": budget,
+            "tolfun": 1e-3,
+            "tolx": 1e-4,
+            "seed": cfg.seed,
+            "verbose": -9,    # silent
+            "popsize": max(4 + int(3 * np.log(n)), cfg.popsize),
+        }
+        if cfg.algorithm == "bipop_cma_es":
+            # Use cma's restart wrapper with BIPOP strategy
+            best, es = cma.fmin2(
+                obj_norm, x0_norm, sigma0, options=opts,
+                bipop=True, restarts=9,
+                incpopsize=2.0,
+            )
+            x_best_norm = best
+            f_best = es.best.f
+            nfev = int(es.countevals) if hasattr(es, "countevals") else 0
+            nit = int(es.countiter) if hasattr(es, "countiter") else 0
+        else:
+            best, es = cma.fmin2(
+                obj_norm, x0_norm, sigma0, options=opts,
+            )
+            x_best_norm = best
+            f_best = es.best.f
+            nfev = int(es.countevals) if hasattr(es, "countevals") else 0
+            nit = int(es.countiter) if hasattr(es, "countiter") else 0
+
+        x_best = lo + np.clip(np.array(x_best_norm), 0.0, 1.0) * scale
+        return _SearchResult(x=x_best, fun=float(f_best),
+                              nit=nit, nfev=nfev,
+                              message=f"cma {cfg.algorithm} converged")
+
+    raise ValueError(f"unknown algorithm: {cfg.algorithm}")
+
+
 def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
              ) -> tuple[TargetAllocations, float | None, float, dict]:
     """Run differential evolution. Returns
@@ -346,6 +446,8 @@ def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
         bounds = list(CPPI_PARAM_BOUNDS)
     elif cfg.policy_class == "bodie_merton":
         bounds = list(BODIE_MERTON_PARAM_BOUNDS)
+    elif cfg.policy_class == "multi_phase":
+        bounds = list(MULTI_PHASE_PARAM_BOUNDS)
     elif cfg.location_mode == "heuristic":
         bounds = [
             (0.0, 1.0), (0.0, 1.0),  # overall stock, bond
@@ -360,15 +462,10 @@ def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
             (0.0, 5.0),              # conversion bracket index
             (0.0, 1.0),              # trad split fraction
         ]
-    res = differential_evolution(
-        obj, bounds=bounds, seed=cfg.seed, maxiter=cfg.maxiter,
-        popsize=cfg.popsize, workers=cfg.workers, polish=cfg.polish,
-        tol=1e-3, mutation=(0.5, 1.0), recombination=0.7,
-        init="sobol", updating="deferred" if cfg.workers != 1 else "immediate",
-    )
+    res = _run_search(obj, bounds, cfg)
     policy = _build_policy(res.x, scn, cfg)
     if cfg.policy_class in ("glide", "three_knot_glide", "bond_tent", "cppi",
-                             "bodie_merton"):
+                             "bodie_merton", "multi_phase"):
         # For glide policies, "current-year" allocations come from
         # policy.decide() at age 0.
         from .policy import StateSummary
@@ -388,8 +485,9 @@ def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
     else:
         allocations, conv_target, trad_split = _decode_free(res.x)
     diag = {"obj_value": float(res.fun), "nit": int(res.nit), "nfev": int(res.nfev),
-            "x": res.x.tolist(), "message": res.message,
+            "x": res.x.tolist(), "message": str(res.message),
             "location_mode": cfg.location_mode,
             "policy_class": cfg.policy_class,
+            "algorithm": cfg.algorithm,
             "policy": policy}
     return allocations, conv_target, trad_split, diag

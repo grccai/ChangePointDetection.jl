@@ -91,10 +91,17 @@ def optimize_cmd(
     policy: str = typer.Option(
         "static",
         help="'static' | 'glide' (2-knot, 12 vars) | 'three_knot_glide' "
-             "(16 vars) | 'bond_tent' (V-shape, 9 vars; Kitces-Pfau) | "
-             "'cppi' (wealth-floor-anchored, 8 vars) | 'bodie_merton' "
-             "(human-capital glide, 6 vars; theoretically grounded).",
+             "(16 vars) | 'bond_tent' (V-shape, 9 vars) | 'cppi' "
+             "(8 vars) | 'bodie_merton' (HC glide, 6 vars) | 'multi_phase' "
+             "(BodieMerton + BondTent + CPPI dispatched by age, 23 vars).",
     ),
+    algorithm: str = typer.Option(
+        "differential_evolution",
+        help="'differential_evolution' (default) | 'cma_es' | 'bipop_cma_es' "
+             "(restart variant, better on noisy/multimodal objectives).",
+    ),
+    max_evals: int | None = typer.Option(
+        None, help="Total evaluation budget cap (CMA-ES variants only)."),
     objective: str = typer.Option(
         "utility",
         help="'utility' (CRRA + bequest + failure penalty) | 'fire_prob' "
@@ -119,7 +126,8 @@ def optimize_cmd(
                          fire_age=fire_age if objective in fire_objs else None,
                          fire_target_real=fire_target if objective in fire_objs
                                           else None,
-                         ruin_max=ruin_max)
+                         ruin_max=ruin_max,
+                         algorithm=algorithm, max_evals=max_evals)
     print("Running differential evolution... (this can take a few minutes)")
     allocations, conv_bracket, trad_split, diag = optimize(scn, cfg)
     print(f"\n=== Optimal decisions (policy={diag['policy_class']}) ===")
