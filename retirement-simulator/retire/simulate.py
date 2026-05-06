@@ -542,6 +542,7 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
 
     if scn.spending.flexible is not None and years_into_retire >= 0:
         flex = scn.spending.flexible
+        current_floor = flex.floor_at(age)
         current_real = s.total_value() / s.cumulative_inflation
         # ratio relative to retirement-start real wealth; safe-divide.
         baseline = np.where(s.flex_baseline_wealth > 0,
@@ -549,12 +550,10 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
         ratio = current_real / baseline
         # Downside-only proportional scaling, then clamp to [floor/base, 1].
         scaling = np.minimum(1.0, 1.0 + flex.sensitivity * (ratio - 1.0))
-        floor_scaling = (flex.floor_real / base_real
-                         if base_real > 0 else 0.0)
+        floor_scaling = (current_floor / base_real if base_real > 0 else 0.0)
         scaling = np.maximum(scaling, floor_scaling)
         real_target = base_real * scaling
-        # Hard floor as belt-and-suspenders (in case base_real == 0).
-        real_target = np.maximum(real_target, flex.floor_real)
+        real_target = np.maximum(real_target, current_floor)
     else:
         real_target = np.full(P, base_real)
 

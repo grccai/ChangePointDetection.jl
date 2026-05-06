@@ -61,8 +61,10 @@ spending:
                                 # everything above (taxes + contribs + this)
                                 # flows to taxable savings.
   flexible:                     # variable-percentage withdrawal in retirement
-    floor_real:   80000         # never spend less than this
-    sensitivity:  1.0           # 1.0 = full proportional cuts on drawdown
+    floor_real:        50000    # tight floor pre-Medicare (preserves ACA + portfolio)
+    floor_change_age:  65       # at Medicare eligibility...
+    floor_after_real:  80000    # ...the floor lifts back to $80k real
+    sensitivity:       1.0      # 1.0 = full proportional cuts on drawdown
 
 initial_portfolio:
   taxable:

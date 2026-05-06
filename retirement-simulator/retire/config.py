@@ -110,24 +110,26 @@ class SocialSecurity:
 class FlexibleSpending:
     """Flexible / variable-percentage withdrawal during retirement.
 
-    Spending each year is the smile-adjusted baseline scaled toward `floor_real`
-    when the portfolio is below its retirement-start trajectory:
+    Spending each year is the smile-adjusted baseline scaled toward the
+    current floor when the portfolio is below its retirement-start trajectory:
 
         ratio = current_real_wealth / wealth_at_retirement_start
         scaling = clamp(1 + sensitivity * (ratio - 1), floor/base, 1)
-        spend  = max(floor_real, base_real * smile_factor * scaling)
+        spend  = max(floor_real_at_age, base_real * smile_factor * scaling)
 
-    With `sensitivity=1.0` (default) the cut is fully proportional to the
-    drawdown from retirement-start wealth: a 25% drop in real wealth
-    triggers a 25% spending cut, capped at `floor_real`. With
-    `sensitivity=0.0`, spending is fixed (no flex). Values >1 are more
-    aggressive cuts; values <1 are gentler.
-
-    No upside: spending is never raised above the smile-adjusted baseline.
-    (Easy to extend to a ceiling if wanted.)
-    """
+    The floor is age-dependent if `floor_change_age` and `floor_after_real`
+    are set: floor = `floor_real` strictly before `floor_change_age`, then
+    `floor_after_real` from that age on. (Useful for "live tight pre-
+    Medicare for ACA subsidy then loosen up at 65.")"""
     floor_real: float
     sensitivity: float = 1.0
+    floor_change_age: int | None = None
+    floor_after_real: float | None = None
+
+    def floor_at(self, age: float) -> float:
+        if self.floor_change_age is None or self.floor_after_real is None:
+            return self.floor_real
+        return self.floor_after_real if age >= self.floor_change_age else self.floor_real
 
 
 @dataclass
