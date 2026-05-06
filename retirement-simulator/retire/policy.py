@@ -71,6 +71,12 @@ class StateSummary:
     fire_target_real: float
     median_real_wealth: float       # cross-path median (or sample mean)
     fire_progress_ratio: float       # median_real_wealth / fire_target_real
+    # Realized stock-return volatility over a trailing window — used by
+    # volatility-targeting policies. Computed by the simulator at the
+    # median-wealth path's recent stock-return draws. Defaults to the
+    # market's configured stock vol on early years before enough history
+    # accumulates.
+    recent_realized_vol: float = 0.18
 
 
 # ---------- Policy Protocol ----------
@@ -710,6 +716,107 @@ BODIE_MERTON_PARAM_BOUNDS: list[tuple[float, float]] = [
     (0.0, 5.0),      # conv FIRE-gap idx
     (0.0, 5.0),      # conv SS-window idx
     (0.0, 1.0),      # trad split
+]
+
+
+# ---------- Volatility Targeting ----------
+
+@dataclass
+class VolatilityTargetingPolicy:
+    """Counter-cyclical risk allocation: target a fixed portfolio vol level
+    by scaling stock fraction inversely with realized vol.
+
+        stock_frac(t) = clamp(base_stock · target_vol / max(realized_vol, eps),
+                               0, upper_cap)
+
+    When recent markets are calm (realized_vol low), stock fraction rises
+    above base; when volatile, it falls. Empirically reduces sequence-of-
+    returns drawdowns 20-40% in institutional studies (eg, Moreira & Muir).
+
+    Same per-account allocation pattern as bond_tent / cppi: cash forbidden
+    in Trad/Roth; configurable cash buffer in taxable."""
+    target_vol: float        # e.g., 0.10 for 10% target vol
+    base_stock_frac: float   # baseline allocation when realized_vol == target
+    upper_stock_cap: float = 1.0
+    taxable_cash: float = 0.0
+
+    conv_during_fire_gap: float | None = None
+    conv_during_ss_window: float | None = None
+    trad_contribution_split: float = 1.0
+
+    retirement_age: float = 0.0
+    ss_age: float = 67.0
+    rmd_age: float = 73.0
+
+    def decide(self, ss: StateSummary) -> Decision:
+        age = ss.age
+        eps = 1e-3
+        scale = self.target_vol / max(ss.recent_realized_vol, eps)
+        raw_stock = self.base_stock_frac * scale
+        stock = _clip(raw_stock, 0.0, self.upper_stock_cap)
+
+        tax_cash = _clip(self.taxable_cash, 0.0, max(0.0, 1.0 - stock))
+        tax = _alloc(stock, max(0.0, 1.0 - stock - tax_cash))
+        trad = _alloc(stock, max(0.0, 1.0 - stock))
+        roth = _alloc(stock, max(0.0, 1.0 - stock))
+
+        if age < self.retirement_age:
+            conv = None
+        elif age < self.ss_age:
+            conv = self.conv_during_fire_gap
+        elif age < self.rmd_age:
+            conv = self.conv_during_ss_window
+        else:
+            conv = None
+
+        return Decision(
+            allocations=TargetAllocations(taxable=tax, traditional=trad, roth=roth),
+            conversion_bracket=conv,
+            trad_contribution_split=self.trad_contribution_split,
+        )
+
+
+def build_vol_targeting_policy(x: list[float] | tuple[float, ...],
+                                retirement_age: float, ss_age: float = 67.0,
+                                rmd_age: float = 73.0
+                                ) -> VolatilityTargetingPolicy:
+    """Decode an 8-element vector to a VolatilityTargetingPolicy.
+
+    Parameter layout:
+      0  target_vol             [0.04, 0.20]   typical 0.08-0.14
+      1  base_stock_frac        [0, 1]
+      2  upper_stock_cap        [0, 1]
+      3  taxable_cash           [0, 0.4]
+      4  conv FIRE-gap idx      (snapped)
+      5  conv SS-window idx     (snapped)
+      6  trad split             [0, 1]
+      7  (reserved, kept for parity with cppi/bond_tent search dim)
+    """
+    if len(x) != 8:
+        raise ValueError(f"expected 8 params for vol_targeting, got {len(x)}")
+    return VolatilityTargetingPolicy(
+        target_vol=max(0.04, min(0.20, x[0])),
+        base_stock_frac=_clip(x[1]),
+        upper_stock_cap=_clip(x[2]),
+        taxable_cash=_clip(x[3], 0.0, 0.4),
+        conv_during_fire_gap=_snap_bracket(x[4]),
+        conv_during_ss_window=_snap_bracket(x[5]),
+        trad_contribution_split=_clip(x[6]),
+        retirement_age=retirement_age,
+        ss_age=ss_age,
+        rmd_age=rmd_age,
+    )
+
+
+VOL_TARGETING_PARAM_BOUNDS: list[tuple[float, float]] = [
+    (0.04, 0.20),    # target_vol
+    (0.0, 1.0),      # base_stock_frac
+    (0.0, 1.0),      # upper_stock_cap
+    (0.0, 0.4),      # taxable_cash
+    (0.0, 5.0),      # conv FIRE-gap
+    (0.0, 5.0),      # conv SS-window
+    (0.0, 1.0),      # trad split
+    (0.0, 1.0),      # reserved
 ]
 
 

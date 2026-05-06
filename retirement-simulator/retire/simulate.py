@@ -333,16 +333,32 @@ def simulate(scn: Scenario,
         # ---- query policy with current state summary ----
         if y == 0:
             median_real_w = float(s.real_wealth[:, 0].mean())
+            median_idx = 0
         else:
-            median_real_w = float(np.median(s.real_wealth[:, y]))
+            sort_idx = np.argsort(s.real_wealth[:, y])
+            median_idx = int(sort_idx[P // 2])
+            median_real_w = float(s.real_wealth[median_idx, y])
         progress = (median_real_w / fire_target_real
                     if fire_target_real > 0 else 1.0)
+        # Realized-volatility signal: rolling std of the median path's
+        # recent stock-return draws. Defaults to the configured stock vol
+        # on early years before enough history accumulates.
+        L = 5  # lookback window (years)
+        if y >= 2:
+            recent = R[median_idx, max(0, y - L):y, 0]   # stock returns
+            if recent.size >= 2:
+                rec_vol = float(recent.std(ddof=1))
+            else:
+                rec_vol = float(market.params[Asset.STOCK].vol)
+        else:
+            rec_vol = float(market.params[Asset.STOCK].vol)
         ss = StateSummary(
             age=age, year_idx=y,
             years_to_retirement=max(0.0, retirement_age - age),
             fire_target_real=fire_target_real,
             median_real_wealth=median_real_w,
             fire_progress_ratio=progress,
+            recent_realized_vol=rec_vol,
         )
         decision = policy.decide(ss)
         targets_taxable = _alloc_to_array(decision.allocations.taxable)
