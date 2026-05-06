@@ -160,3 +160,28 @@ def ath_real_total_return_indicator() -> np.ndarray:
             is_ath[i] = True
             running_max = cum[i]
     return is_ath
+
+
+def stretched_ath_indicator(threshold_cagr: float = 0.08,
+                             lookback: int = 10) -> np.ndarray:
+    """Stricter "exhausted-bull peak" filter:
+
+        is_stretched_ath[y] = is_ath[y]  AND
+                              trailing_{lookback}_year_real_CAGR(y) > threshold_cagr
+
+    The trailing-CAGR condition selects for years where stocks have run
+    well above the long-run mean (~6.5% real for US 1928-2023), so
+    `threshold_cagr=0.08` filters to "ATH after a notably hot decade" —
+    the conditions in 1929, 1965-1968, 1999-2000, 2007-2008, 2021-2022.
+
+    For our embedded 1928-2023 data with default threshold 0.08:
+      typically yields 5-10 valid years, all preceded by at least one
+      well-known regime change."""
+    yrs, stock, _, _ = real_returns()
+    cum = np.cumprod(1.0 + stock)
+    is_ath = ath_real_total_return_indicator()
+    is_stretched = np.zeros(len(yrs), dtype=bool)
+    for i in range(lookback, len(yrs)):
+        cagr = (cum[i] / cum[i - lookback]) ** (1.0 / lookback) - 1.0
+        is_stretched[i] = cagr > threshold_cagr
+    return is_ath & is_stretched

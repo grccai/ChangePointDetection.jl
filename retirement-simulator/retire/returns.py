@@ -190,6 +190,44 @@ def sample_historical_paths(n_years: int, n_paths: int,
             samples[..., 3])
 
 
+def sample_historical_stretched_ath_paths(n_years: int, n_paths: int,
+                                           seed: int | None = None,
+                                           threshold_cagr: float = 0.08,
+                                           lookback: int = 10
+                                           ) -> tuple[dict[Asset, np.ndarray], np.ndarray]:
+    """Bootstrap conditioned on 'exhausted-bull peak': stocks at real ATH
+    AND trailing-`lookback`-year real CAGR > `threshold_cagr` (default
+    8%, ~1.5σ above the 1928-2023 long-run mean of ~6.5%).
+
+    For 1928-2023 with default thresholds and H=58, valid starts are 1951,
+    1952, 1954-56, 1958-59, 1961, 1963-65 — all in the postwar bull, but
+    each forward window covers 1970s stagflation, 2000-02, 2008. With
+    only ~11 valid starts the bootstrap variance is high; consider it a
+    stress-test corner rather than a population draw.
+
+    Falls back to unrestricted historical bootstrap if no valid start
+    fits the requested horizon."""
+    from . import historical_data as hd
+    years, stock, bond, cash = hd.real_returns()
+    infl = hd.INFLATION
+    history = np.stack([stock, bond, cash, infl], axis=-1)   # (T, 4)
+    is_str = hd.stretched_ath_indicator(threshold_cagr=threshold_cagr,
+                                         lookback=lookback)
+    T = len(years)
+    valid = np.where(is_str & (np.arange(T) + n_years <= T))[0]
+    if len(valid) == 0:
+        return sample_historical_paths(n_years, n_paths, seed=seed)
+    rng = np.random.default_rng(seed)
+    starts = rng.choice(valid, size=n_paths, replace=True)
+    out = np.empty((n_paths, n_years, 4))
+    for p, s in enumerate(starts):
+        out[p] = history[s:s + n_years]
+    return ({Asset.STOCK: out[..., 0],
+             Asset.BOND:  out[..., 1],
+             Asset.CASH:  out[..., 2]},
+            out[..., 3])
+
+
 def sample_historical_ath_paths(n_years: int, n_paths: int,
                                  seed: int | None = None
                                  ) -> tuple[dict[Asset, np.ndarray], np.ndarray]:

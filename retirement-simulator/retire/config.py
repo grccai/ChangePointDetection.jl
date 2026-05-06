@@ -227,7 +227,8 @@ class SimulationParams:
     #                   T-bill) with realised CPI for inflation. Captures
     #                   real bull/bear sequence-of-returns dynamics.
     return_model: Literal["gbm", "deterministic", "historical",
-                          "historical_ath", "bootstrap"] = "gbm"
+                          "historical_ath", "historical_stretched_ath",
+                          "bootstrap"] = "gbm"
 
 
 @dataclass

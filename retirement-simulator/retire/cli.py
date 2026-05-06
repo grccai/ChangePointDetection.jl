@@ -114,10 +114,17 @@ def optimize_cmd(
                                        "(only for fire_prob)."),
     ruin_max: float = typer.Option(0.01, help="Maximum P(ruin) constraint "
                                     "(only for fire_prob)."),
+    robust_modes: str = typer.Option(
+        "gbm,historical",
+        help="Comma-separated return modes for fire_prob_robust. Choices: "
+             "'gbm', 'historical', 'historical_ath', "
+             "'historical_stretched_ath', 'deterministic'.",
+    ),
 ) -> None:
     """Optimize allocation and contribution split for the scenario."""
     scn = load_scenario(config)
     fire_objs = {"fire_prob", "fire_prob_weighted", "fire_prob_robust"}
+    robust_mode_list = [m.strip() for m in robust_modes.split(",") if m.strip()]
     cfg = OptimizerConfig(gamma=gamma, n_paths_inner=paths, maxiter=maxiter,
                          popsize=popsize, workers=workers,
                          location_mode=location_mode, policy_class=policy,
@@ -126,6 +133,7 @@ def optimize_cmd(
                          fire_target_real=fire_target if objective in fire_objs
                                           else None,
                          ruin_max=ruin_max,
+                         robust_return_modes=robust_mode_list,
                          algorithm=algorithm, max_evals=max_evals)
     print("Running differential evolution... (this can take a few minutes)")
     allocations, conv_bracket, trad_split, diag = optimize(scn, cfg)
@@ -204,7 +212,7 @@ def optimize_cmd(
         from copy import deepcopy
         # Re-evaluate the optimum under EACH mode to give per-mode metrics.
         print(f"\n=== fire_prob_robust: per-mode final evaluation ===")
-        modes = ["gbm", "historical"]
+        modes = robust_mode_list
         start_age = scn.profile.age
         horizon = scn.profile.horizon()
         year_indices = [min(horizon, max(0, int(round(fire_age + i - start_age))))
