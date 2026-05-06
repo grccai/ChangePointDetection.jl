@@ -24,7 +24,8 @@ SNAP_DIR = Path(__file__).resolve().parent.parent / "snapshots"
 FIG_DIR = Path(__file__).resolve().parent
 FIG_DIR.mkdir(exist_ok=True)
 
-STRATEGIES = ["static_baseline", "bond_tent_robust", "bodie_merton"]
+STRATEGIES = ["static_baseline", "bond_tent_robust",
+              "bond_tent_stretched", "bodie_merton"]
 RETURN_MODES = ["gbm", "historical", "historical_ath", "historical_stretched_ath"]
 MODE_LABELS = {
     "gbm": "GBM (lognormal)",
@@ -34,7 +35,8 @@ MODE_LABELS = {
 }
 STRAT_LABELS = {
     "static_baseline": "Static 90/0/10",
-    "bond_tent_robust": "Bond Tent (robust)",
+    "bond_tent_robust": "BondTent [gbm,hist_ath]",
+    "bond_tent_stretched": "BondTent [gbm,stretched_ath]",
     "bodie_merton": "Bodie-Merton HC",
 }
 
@@ -112,6 +114,7 @@ def fire_ruin_grid():
                               sharex=True)
     colors = {"static_baseline": "#888888",
               "bond_tent_robust": "#1f77b4",
+              "bond_tent_stretched": "#9467bd",
               "bodie_merton": "#2ca02c"}
     for c, mode in enumerate(RETURN_MODES):
         ax_fire = axes[0, c]

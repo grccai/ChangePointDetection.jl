@@ -58,6 +58,18 @@ def bond_tent_known_good(scn):
     return build_bond_tent_policy(x, retirement_age=retirement_age)
 
 
+def bond_tent_stretched_robust(scn):
+    """[gbm, historical_stretched_ath] DE optimum (3328 evals, 25 gens).
+    Tent at retirement, stock_low ~0%, strong wealth_responsiveness."""
+    retirement_age = scn.profile.retirement_age
+    tent_offset = 54.8 - retirement_age
+    # conv_during_fire_gap = 0.12 -> idx ~0; conv_during_ss_window = 0.24 -> idx
+    # we used 0.0 / 0.24 - skipping discrete bracket snap details, use
+    # representative idx values.
+    x = [0.9616, 0.0018, tent_offset, 10.3, 0.3004, 0.5, 1.0, 0.999, 1.477]
+    return build_bond_tent_policy(x, retirement_age=retirement_age)
+
+
 def bodie_merton_default(scn):
     """gamma=3, r_hc=3%, light taxable cash."""
     retirement_age = scn.profile.retirement_age
@@ -69,6 +81,7 @@ def bodie_merton_default(scn):
 STRATEGIES = {
     "static_baseline": static_policy_from_yaml,
     "bond_tent_robust": bond_tent_known_good,
+    "bond_tent_stretched": bond_tent_stretched_robust,
     "bodie_merton": bodie_merton_default,
 }
 
