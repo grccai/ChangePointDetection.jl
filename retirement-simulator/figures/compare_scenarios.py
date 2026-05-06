@@ -12,6 +12,7 @@ MODES = ["gbm", "historical", "historical_ath", "historical_stretched_ath"]
 CASES = [
     ("trial",            2_500_000.0, "trial / FIRE=$2.5M"),
     ("trial",            3_000_000.0, "trial / FIRE=$3.0M"),
+    ("trial",            5_000_000.0, "trial / FIRE=$5.0M"),
     ("trial_zero_floor", 2_500_000.0, "zero_floor / FIRE=$2.5M"),
 ]
 
