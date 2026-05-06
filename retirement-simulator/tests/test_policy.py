@@ -174,6 +174,59 @@ def test_glide_param_bounds_length_matches_decoder():
     assert len(GLIDE_PARAM_BOUNDS) == 12
 
 
+def test_bond_tent_v_shape():
+    """Stock fraction is high pre-tent, dips to stock_low at tent_age, climbs back."""
+    from retire.policy import build_bond_tent_policy
+    x = [0.95, 0.20, 0.0, 8.0, 0.05, 2.0, 4.0, 1.0, 0.0]
+    p = build_bond_tent_policy(x, retirement_age=55.0)
+    # tent at age 55 (offset 0), stock_low = 0.20
+    d_tent = p.decide(_ss(age=55.0, year_idx=18))
+    assert math.isclose(d_tent.allocations.taxable.stock, 0.20, abs_tol=1e-6)
+    # Far from tent (age 35 = 20 years before, well beyond span=8)
+    d_far = p.decide(_ss(age=35.0, year_idx=0))
+    assert math.isclose(d_far.allocations.taxable.stock, 0.95, abs_tol=1e-6)
+    # 4 years from tent (offset 4, span 8 -> halfway between low and high)
+    d_mid = p.decide(_ss(age=51.0, year_idx=14))
+    expected = 0.20 + 0.5 * (0.95 - 0.20)
+    assert math.isclose(d_mid.allocations.taxable.stock, expected, abs_tol=1e-6)
+
+
+def test_cppi_protects_floor():
+    """CPPI: stock fraction collapses as wealth approaches the floor."""
+    from retire.policy import build_cppi_policy
+    # floor = $1M, m = 3, no growth
+    x = [1.0, 0.0, 3.0, 1.0, 0.05, 0.0, 0.0, 1.0]
+    p = build_cppi_policy(x, retirement_age=55.0)
+    # Wealth = $2M -> cushion = $1M -> stock = 3*1/2 = 1.5 -> capped at upper_cap=1
+    d_rich = p.decide(_ss(age=37, year_idx=0, wealth=2_000_000, target=2_500_000))
+    assert math.isclose(d_rich.allocations.taxable.stock, 1.0, abs_tol=1e-6)
+    # Wealth = $1.2M -> cushion = $0.2M -> stock = 3*0.2/1.2 = 0.5
+    d_mid = _ss(age=37, year_idx=0, wealth=1_200_000, target=2_500_000)
+    d_mid.median_real_wealth = 1_200_000
+    d_mid_dec = p.decide(d_mid)
+    assert math.isclose(d_mid_dec.allocations.taxable.stock, 0.5, abs_tol=1e-3)
+    # Wealth at floor -> stock = 0
+    d_floor = _ss(age=37, year_idx=0, wealth=1_000_000, target=2_500_000)
+    d_floor.median_real_wealth = 1_000_000
+    d_floor_dec = p.decide(d_floor)
+    assert d_floor_dec.allocations.taxable.stock == 0.0
+    # Wealth below floor -> stock = 0
+    d_under = _ss(age=37, year_idx=0, wealth=500_000, target=2_500_000)
+    d_under.median_real_wealth = 500_000
+    d_under_dec = p.decide(d_under)
+    assert d_under_dec.allocations.taxable.stock == 0.0
+
+
+def test_bond_tent_param_bounds_length():
+    from retire.policy import BOND_TENT_PARAM_BOUNDS
+    assert len(BOND_TENT_PARAM_BOUNDS) == 9
+
+
+def test_cppi_param_bounds_length():
+    from retire.policy import CPPI_PARAM_BOUNDS
+    assert len(CPPI_PARAM_BOUNDS) == 8
+
+
 def test_three_knot_glide_decoder():
     from retire.policy import (build_three_knot_glide_policy,
                                 THREE_KNOT_GLIDE_PARAM_BOUNDS)

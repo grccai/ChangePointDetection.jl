@@ -83,6 +83,9 @@ def _clip(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
+# Note: _clip is used both as _clip(x) → [0,1] and _clip(x, lo, hi) → [lo, hi].
+
+
 def _alloc(stock: float, bond: float) -> Allocation:
     s = _clip(stock, 0.0, 1.0)
     b = _clip(bond, 0.0, 1.0 - s)
@@ -344,4 +347,227 @@ THREE_KNOT_GLIDE_PARAM_BOUNDS: list[tuple[float, float]] = [
     (0.0, 5.0),                           # conv SS-window
     (0.0, 1.0),                           # trad split
     (0.0, 2.0),                           # wealth_responsiveness
+]
+
+
+# ---------- Bond Tent (Kitces & Pfau): V-shaped equity glide ----------
+
+@dataclass
+class BondTentPolicy:
+    """V-shaped equity allocation:
+
+        offset = |age - tent_age|
+        stock(age) = stock_high                                  if offset >= span
+                   = stock_low + (stock_high - stock_low) * offset/span    otherwise
+
+    Idea: equity is high in accumulation, dipping to a low at the tent age
+    (typically near retirement), then climbing back as the
+    sequence-of-returns risk window passes. Wealth-responsiveness term is
+    optional; when zero the policy is purely age-driven.
+
+    Same stock fraction across all three accounts; bond = 1 - stock in
+    Trad/Roth (cash forbidden); taxable holds an additional `taxable_cash`
+    fraction with bond = 1 - stock - taxable_cash."""
+    stock_high: float
+    stock_low: float
+    tent_age: float
+    span: float
+    taxable_cash: float = 0.0
+
+    conv_during_fire_gap: float | None = None
+    conv_during_ss_window: float | None = None
+    trad_contribution_split: float = 1.0
+    wealth_responsiveness: float = 0.0
+
+    retirement_age: float = 0.0
+    ss_age: float = 67.0
+    rmd_age: float = 73.0
+
+    def _stock_at(self, age: float) -> float:
+        offset = abs(age - self.tent_age)
+        if self.span <= 0:
+            return self.stock_high
+        if offset >= self.span:
+            return self.stock_high
+        return self.stock_low + (self.stock_high - self.stock_low) * (offset / self.span)
+
+    def decide(self, ss: StateSummary) -> Decision:
+        age = ss.age
+        stock = self._stock_at(age)
+        # Optional wealth-responsiveness on top of the tent shape
+        if self.wealth_responsiveness != 0 and ss.year_idx > 2 \
+                and ss.fire_target_real > 0:
+            shift = -self.wealth_responsiveness * (ss.fire_progress_ratio - 1.0)
+            stock = _clip(stock + shift)
+
+        tax_cash = _clip(self.taxable_cash, 0.0, max(0.0, 1.0 - stock))
+        tax = _alloc(stock, max(0.0, 1.0 - stock - tax_cash))
+        trad = _alloc(stock, max(0.0, 1.0 - stock))
+        roth = _alloc(stock, max(0.0, 1.0 - stock))
+
+        if age < self.retirement_age:
+            conv = None
+        elif age < self.ss_age:
+            conv = self.conv_during_fire_gap
+        elif age < self.rmd_age:
+            conv = self.conv_during_ss_window
+        else:
+            conv = None
+
+        return Decision(
+            allocations=TargetAllocations(taxable=tax, traditional=trad, roth=roth),
+            conversion_bracket=conv,
+            trad_contribution_split=self.trad_contribution_split,
+        )
+
+
+def build_bond_tent_policy(x: list[float] | tuple[float, ...],
+                            retirement_age: float, ss_age: float = 67.0,
+                            rmd_age: float = 73.0) -> BondTentPolicy:
+    """Decode a 9-element vector to a BondTentPolicy.
+
+    Parameter layout:
+      0  stock_high              [0, 1]
+      1  stock_low               [0, 1]    (clipped to <= stock_high)
+      2  tent_age_offset         [-15, 20] relative to retirement_age
+      3  span                    [3, 30]   years
+      4  taxable_cash            [0, 0.4]
+      5  conv FIRE-gap idx       (snapped to discrete bracket)
+      6  conv SS-window idx      (snapped)
+      7  trad split              [0, 1]
+      8  wealth_responsiveness   [0, 2]"""
+    if len(x) != 9:
+        raise ValueError(f"expected 9 params for bond_tent, got {len(x)}")
+    sh = _clip(x[0])
+    sl = min(_clip(x[1]), sh)   # ensure stock_low <= stock_high
+    return BondTentPolicy(
+        stock_high=sh, stock_low=sl,
+        tent_age=retirement_age + max(-15.0, min(20.0, x[2])),
+        span=max(3.0, min(30.0, x[3])),
+        taxable_cash=_clip(x[4], 0.0, 0.4),
+        conv_during_fire_gap=_snap_bracket(x[5]),
+        conv_during_ss_window=_snap_bracket(x[6]),
+        trad_contribution_split=_clip(x[7]),
+        wealth_responsiveness=max(0.0, min(2.0, x[8])),
+        retirement_age=retirement_age,
+        ss_age=ss_age,
+        rmd_age=rmd_age,
+    )
+
+
+BOND_TENT_PARAM_BOUNDS: list[tuple[float, float]] = [
+    (0.0, 1.0),     # stock_high
+    (0.0, 1.0),     # stock_low
+    (-15.0, 20.0),  # tent_age_offset
+    (3.0, 30.0),    # span
+    (0.0, 0.4),     # taxable_cash
+    (0.0, 5.0),     # conv FIRE-gap idx
+    (0.0, 5.0),     # conv SS-window idx
+    (0.0, 1.0),     # trad split
+    (0.0, 2.0),     # wealth_responsiveness
+]
+
+
+# ---------- CPPI (Constant Proportion Portfolio Insurance) ----------
+
+@dataclass
+class CPPIPolicy:
+    """Wealth-anchored allocation:
+
+        cushion = max(0, real_wealth - floor_real(t))
+        stock_frac = clamp(multiplier * cushion / real_wealth, 0, upper_stock_cap)
+        floor_real(t) = floor_real_at_start * (1 + floor_growth_rate)^t
+
+    Mechanically protects the floor: as wealth approaches floor, stock
+    fraction collapses to 0 (insurance kicks in). As wealth grows above
+    floor, the multiplier amplifies risk-taking. Different *shape* of
+    risk-taking from age-glide policies — entirely state-driven, not
+    age-driven.
+
+    Uses cross-path median real wealth (per the StateSummary architecture);
+    decisions are broadcast to all paths each year, so this is the
+    median-path CPPI approximation."""
+    floor_real_at_start: float    # in real $
+    floor_growth_rate: float
+    multiplier: float
+    upper_stock_cap: float = 1.0
+    taxable_cash: float = 0.0
+
+    conv_during_fire_gap: float | None = None
+    conv_during_ss_window: float | None = None
+    trad_contribution_split: float = 1.0
+
+    retirement_age: float = 0.0
+    ss_age: float = 67.0
+    rmd_age: float = 73.0
+
+    def decide(self, ss: StateSummary) -> Decision:
+        age = ss.age
+        floor_now = self.floor_real_at_start * (1 + self.floor_growth_rate) ** ss.year_idx
+        W = max(1.0, ss.median_real_wealth)
+        cushion = max(0.0, W - floor_now)
+        raw_stock = self.multiplier * cushion / W
+        stock = _clip(raw_stock, 0.0, self.upper_stock_cap)
+
+        tax_cash = _clip(self.taxable_cash, 0.0, max(0.0, 1.0 - stock))
+        tax = _alloc(stock, max(0.0, 1.0 - stock - tax_cash))
+        trad = _alloc(stock, max(0.0, 1.0 - stock))
+        roth = _alloc(stock, max(0.0, 1.0 - stock))
+
+        if age < self.retirement_age:
+            conv = None
+        elif age < self.ss_age:
+            conv = self.conv_during_fire_gap
+        elif age < self.rmd_age:
+            conv = self.conv_during_ss_window
+        else:
+            conv = None
+
+        return Decision(
+            allocations=TargetAllocations(taxable=tax, traditional=trad, roth=roth),
+            conversion_bracket=conv,
+            trad_contribution_split=self.trad_contribution_split,
+        )
+
+
+def build_cppi_policy(x: list[float] | tuple[float, ...],
+                      retirement_age: float, ss_age: float = 67.0,
+                      rmd_age: float = 73.0) -> CPPIPolicy:
+    """Decode an 8-element vector to a CPPIPolicy.
+
+    Parameter layout:
+      0  floor_real_at_start ($M)   [0, 3]
+      1  floor_growth_rate           [-0.02, 0.05]
+      2  multiplier                  [1, 5]
+      3  upper_stock_cap             [0, 1]
+      4  taxable_cash                [0, 0.4]
+      5  conv FIRE-gap idx           (snapped)
+      6  conv SS-window idx          (snapped)
+      7  trad split                  [0, 1]"""
+    if len(x) != 8:
+        raise ValueError(f"expected 8 params for cppi, got {len(x)}")
+    return CPPIPolicy(
+        floor_real_at_start=max(0.0, x[0]) * 1_000_000,
+        floor_growth_rate=max(-0.02, min(0.05, x[1])),
+        multiplier=max(1.0, min(5.0, x[2])),
+        upper_stock_cap=_clip(x[3]),
+        taxable_cash=_clip(x[4], 0.0, 0.4),
+        conv_during_fire_gap=_snap_bracket(x[5]),
+        conv_during_ss_window=_snap_bracket(x[6]),
+        trad_contribution_split=_clip(x[7]),
+        retirement_age=retirement_age,
+        ss_age=ss_age,
+        rmd_age=rmd_age,
+    )
+
+
+CPPI_PARAM_BOUNDS: list[tuple[float, float]] = [
+    (0.0, 3.0),      # floor_real_at_start ($M)
+    (-0.02, 0.05),   # floor_growth_rate
+    (1.0, 5.0),      # multiplier
+    (0.0, 1.0),      # upper_stock_cap
+    (0.0, 0.4),      # taxable_cash
+    (0.0, 5.0),      # conv FIRE-gap idx
+    (0.0, 5.0),      # conv SS-window idx
+    (0.0, 1.0),      # trad split
 ]

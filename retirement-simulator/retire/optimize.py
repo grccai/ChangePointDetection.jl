@@ -41,7 +41,9 @@ from .location import heuristic_target_allocations
 from .policy import (Policy, StaticPolicy, GlidePolicy,
                      build_glide_policy, GLIDE_PARAM_BOUNDS,
                      build_three_knot_glide_policy,
-                     THREE_KNOT_GLIDE_PARAM_BOUNDS)
+                     THREE_KNOT_GLIDE_PARAM_BOUNDS,
+                     build_bond_tent_policy, BOND_TENT_PARAM_BOUNDS,
+                     build_cppi_policy, CPPI_PARAM_BOUNDS)
 from .simulate import simulate, SimResult
 
 
@@ -153,6 +155,12 @@ def _build_policy(x: np.ndarray, scn_base: Scenario,
             list(x), start_age=start_age,
             retirement_age=retirement_age,
             end_age=end_age, ss_age=ss_age)
+    if cfg.policy_class == "bond_tent":
+        return build_bond_tent_policy(
+            list(x), retirement_age=retirement_age, ss_age=ss_age)
+    if cfg.policy_class == "cppi":
+        return build_cppi_policy(
+            list(x), retirement_age=retirement_age, ss_age=ss_age)
     # static
     if cfg.location_mode == "heuristic":
         allocations, conv_target, trad_split = _decode_heuristic(x, scn_base)
@@ -326,6 +334,10 @@ def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
         bounds = list(GLIDE_PARAM_BOUNDS)
     elif cfg.policy_class == "three_knot_glide":
         bounds = list(THREE_KNOT_GLIDE_PARAM_BOUNDS)
+    elif cfg.policy_class == "bond_tent":
+        bounds = list(BOND_TENT_PARAM_BOUNDS)
+    elif cfg.policy_class == "cppi":
+        bounds = list(CPPI_PARAM_BOUNDS)
     elif cfg.location_mode == "heuristic":
         bounds = [
             (0.0, 1.0), (0.0, 1.0),  # overall stock, bond
@@ -347,7 +359,7 @@ def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
         init="sobol", updating="deferred" if cfg.workers != 1 else "immediate",
     )
     policy = _build_policy(res.x, scn, cfg)
-    if cfg.policy_class in ("glide", "three_knot_glide"):
+    if cfg.policy_class in ("glide", "three_knot_glide", "bond_tent", "cppi"):
         # For glide policies, "current-year" allocations come from
         # policy.decide() at age 0.
         from .policy import StateSummary

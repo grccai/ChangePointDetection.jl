@@ -15,6 +15,7 @@ from .export import export_allocation_xlsx
 from .location import (heuristic_target_allocations, overall_allocation_of,
                        tax_efficient_dollars)
 from .policy import (build_glide_policy, build_three_knot_glide_policy,
+                     build_bond_tent_policy, build_cppi_policy,
                      StaticPolicy)
 from .simulate import simulate
 from .optimize import optimize, OptimizerConfig
@@ -90,9 +91,10 @@ def optimize_cmd(
     policy: str = typer.Option(
         "static",
         help="'static' (single fixed Decision per year) | 'glide' (2-knot "
-             "glide, 12 vars, no cash in Trad/Roth) | 'three_knot_glide' "
-             "(3-knot glide with mid-knot at retirement, 16 vars, no cash "
-             "in Trad/Roth).",
+             "glide, 12 vars) | 'three_knot_glide' (3-knot glide w/ mid-"
+             "knot at retirement, 16 vars) | 'bond_tent' (V-shaped equity "
+             "around retirement, 9 vars; Kitces-Pfau) | 'cppi' (wealth-"
+             "anchored constant proportion portfolio insurance, 8 vars).",
     ),
     objective: str = typer.Option(
         "utility",
@@ -148,6 +150,29 @@ def optimize_cmd(
         print(f"  conversion bracket SS-window: {gp.conv_during_ss_window}")
         print(f"  wealth_responsiveness: {gp.wealth_responsiveness:.3f} "
               f"(>0 means de-risk when ahead of target)")
+    elif diag["policy_class"] == "bond_tent":
+        bt = diag["policy"]
+        print()
+        print(f"Bond Tent (V-shaped equity around tent_age):")
+        print(f"  stock_high (far from tent):  {bt.stock_high:.2%}")
+        print(f"  stock_low  (at tent):        {bt.stock_low:.2%}")
+        print(f"  tent_age:                    {bt.tent_age:.1f}")
+        print(f"  span (years to recover):     {bt.span:.1f}")
+        print(f"  taxable cash fraction:       {bt.taxable_cash:.2%}")
+        print(f"  conv FIRE-gap:               {bt.conv_during_fire_gap}")
+        print(f"  conv SS-window:              {bt.conv_during_ss_window}")
+        print(f"  wealth_responsiveness:       {bt.wealth_responsiveness:.3f}")
+    elif diag["policy_class"] == "cppi":
+        c = diag["policy"]
+        print()
+        print(f"CPPI (Constant Proportion Portfolio Insurance):")
+        print(f"  floor_real_at_start:        ${c.floor_real_at_start:>12,.0f}")
+        print(f"  floor_growth_rate:           {c.floor_growth_rate:.3%}/yr (real)")
+        print(f"  multiplier (m):              {c.multiplier:.2f}")
+        print(f"  upper_stock_cap:             {c.upper_stock_cap:.2%}")
+        print(f"  taxable cash fraction:       {c.taxable_cash:.2%}")
+        print(f"  conv FIRE-gap:               {c.conv_during_fire_gap}")
+        print(f"  conv SS-window:              {c.conv_during_ss_window}")
     print(f"\nOptimizer diagnostics: nfev={diag['nfev']}, nit={diag['nit']}, "
           f"obj={diag['obj_value']:.3f}")
 
@@ -280,7 +305,8 @@ def export_allocation(
 
     pol = None
     summary = ""
-    if policy.startswith("glide:") or policy.startswith("three_knot:"):
+    if any(policy.startswith(p + ":") for p in
+           ("glide", "three_knot", "bond_tent", "cppi")):
         kind, _, vec_str = policy.partition(":")
         try:
             x = [float(v) for v in vec_str.split(",")]
@@ -294,11 +320,21 @@ def export_allocation(
             pol = build_glide_policy(x, start_age=start_age, end_age=end_age,
                                      retirement_age=retirement_age, ss_age=ss_age)
             summary = f"Policy: 2-knot glide (12 vars)"
-        else:
+        elif kind == "three_knot":
             pol = build_three_knot_glide_policy(
                 x, start_age=start_age, retirement_age=retirement_age,
                 end_age=end_age, ss_age=ss_age)
             summary = f"Policy: 3-knot glide (16 vars), middle knot at age {retirement_age:.0f}"
+        elif kind == "bond_tent":
+            pol = build_bond_tent_policy(x, retirement_age=retirement_age,
+                                          ss_age=ss_age)
+            summary = (f"Policy: bond_tent (9 vars), V-shape "
+                       f"stock_low={pol.stock_low:.2%} at age {pol.tent_age:.0f}")
+        elif kind == "cppi":
+            pol = build_cppi_policy(x, retirement_age=retirement_age,
+                                     ss_age=ss_age)
+            summary = (f"Policy: CPPI (8 vars), floor=${pol.floor_real_at_start:,.0f} "
+                       f"at start, m={pol.multiplier:.1f}")
     else:
         # Default: static StaticPolicy from the scenario's target allocations.
         c = scn.savings.contributions
