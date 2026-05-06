@@ -20,9 +20,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-SNAP_DIR = Path(__file__).resolve().parent.parent / "snapshots"
-FIG_DIR = Path(__file__).resolve().parent
-FIG_DIR.mkdir(exist_ok=True)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCENARIO_ID = os.environ.get("SCENARIO_ID", "trial")
+SNAP_DIR = REPO_ROOT / "snapshots" / SCENARIO_ID
+FIG_SUBDIR = os.environ.get("FIG_SUBDIR", SCENARIO_ID)
+FIG_DIR = Path(__file__).resolve().parent / FIG_SUBDIR
+FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 STRATEGIES = ["static_baseline", "bond_tent_robust",
               "bond_tent_stretched", "bodie_merton"]
@@ -40,8 +43,10 @@ STRAT_LABELS = {
     "bodie_merton": "Bodie-Merton HC",
 }
 
-FIRE_TARGET = 2_500_000.0
-BROKE_THRESHOLD = 250_000.0  # alive but essentially SS-dependent
+FIRE_TARGET = float(os.environ.get("FIRE_TARGET", "2500000"))
+BROKE_THRESHOLD = float(os.environ.get("BROKE_THRESHOLD", "250000"))
+FIG_LABEL = os.environ.get("FIG_LABEL",
+                            f"{SCENARIO_ID} | FIRE=${FIRE_TARGET/1e6:.1f}M")
 
 # Gompertz survival from current age 37 (matches scenario's birthdate +
 # start_date). Uses the codebase's "healthy_65" parameters (b=2.4e-5,
@@ -112,7 +117,8 @@ def fan_grid():
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=4,
                bbox_to_anchor=(0.5, 0.995), fontsize=9, frameon=False)
-    fig.suptitle("Real wealth fan charts: 3 strategies × 4 return scenarios",
+    fig.suptitle(f"Real wealth fan charts: 4 strategies × 4 return scenarios "
+                 f"  [{FIG_LABEL}]",
                  fontsize=12, y=1.01)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     out = FIG_DIR / "fan_grid.png"
@@ -157,8 +163,8 @@ def fire_ruin_grid():
             ax_ruin.set_ylabel("P(ever ruined by age)")
         ax_ruin.set_xlabel("age")
     axes[0, 0].legend(fontsize=8, frameon=False)
-    fig.suptitle("FIRE-target probability and cumulative ruin probability vs age",
-                 fontsize=12)
+    fig.suptitle(f"FIRE-target probability and cumulative ruin probability "
+                 f"vs age  [{FIG_LABEL}]", fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     out = FIG_DIR / "fire_ruin_grid.png"
     fig.savefig(out, dpi=130, bbox_inches="tight")
@@ -209,8 +215,8 @@ def allocation_grid():
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=3,
                bbox_to_anchor=(0.5, 0.995), fontsize=9, frameon=False)
-    fig.suptitle("Asset allocation along the median wealth path",
-                 fontsize=12, y=1.01)
+    fig.suptitle(f"Asset allocation along the median wealth path  "
+                 f"[{FIG_LABEL}]", fontsize=12, y=1.01)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     out = FIG_DIR / "allocation_grid.png"
     fig.savefig(out, dpi=130, bbox_inches="tight")
@@ -257,7 +263,7 @@ def spaghetti_grid(n_show: int = 80, seed: int = 0):
             if r == rows - 1:
                 ax.set_xlabel("age")
     fig.suptitle(f"Individual wealth trajectories ({n_show} sampled paths "
-                 f"per cell; median in red)", fontsize=12)
+                 f"per cell; median in red)  [{FIG_LABEL}]", fontsize=12)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     out = FIG_DIR / "spaghetti_grid.png"
     fig.savefig(out, dpi=130, bbox_inches="tight")
@@ -307,8 +313,9 @@ def richbrokedead_grid():
     fig.legend(handles, labels, loc="upper center", ncol=4,
                bbox_to_anchor=(0.5, 0.995), fontsize=9, frameon=False)
     fig.suptitle(
-        "Outcome probability over time: rich / comfortable / broke / deceased "
-        "(Gompertz healthy from age 37)", fontsize=12, y=1.01)
+        f"Outcome probability over time: rich / comfortable / broke / deceased "
+        f"(Gompertz healthy from age 37)  [{FIG_LABEL}]",
+        fontsize=12, y=1.01)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     out = FIG_DIR / "richbrokedead_grid.png"
     fig.savefig(out, dpi=130, bbox_inches="tight")

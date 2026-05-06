@@ -9,4 +9,5 @@ dist/
 
 # Snapshot data files (large numpy archives) — regenerable via
 # figures/run_snapshots.py
-snapshots/*.npz
+snapshots/
+

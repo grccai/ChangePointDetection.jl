@@ -3,8 +3,10 @@ snapshot the lightweight arrays we need for visualization.
 
 Usage:
     PYTHONPATH=. python figures/run_snapshots.py
+    SCENARIO_ID=trial_zero_floor SCENARIO_YAML=examples/trial_zero_floor.yaml \
+        PYTHONPATH=. python figures/run_snapshots.py
 
-Writes one .npz per (strategy, return_mode) into snapshots/.
+Writes one .npz per (strategy, return_mode) into snapshots/{SCENARIO_ID}/.
 Re-running overwrites; visualization scripts load these snapshots so we can
 iterate on plots without re-running MC.
 """
@@ -24,8 +26,7 @@ from retire.policy import (
 from retire.config import Allocation, TargetAllocations
 
 
-SNAP_DIR = os.path.join(os.path.dirname(__file__), "..", "snapshots")
-os.makedirs(SNAP_DIR, exist_ok=True)
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def static_policy_from_yaml(scn) -> StaticPolicy:
@@ -89,7 +90,7 @@ RETURN_MODES = ["gbm", "historical", "historical_ath", "historical_stretched_ath
 
 
 def run_one(strategy_name: str, policy, scn, return_mode: str,
-            n_paths: int, seed: int) -> str:
+            n_paths: int, seed: int, snap_dir: str) -> str:
     scn.simulation.return_model = return_mode
     scn.simulation.n_paths = n_paths
     scn.simulation.seed = seed
@@ -103,7 +104,7 @@ def run_one(strategy_name: str, policy, scn, return_mode: str,
     failed = np.array([p.failed for p in result.paths])
     ages = np.array([scn.profile.age_at_year(y) for y in range(H1)])
     bal = result.real_balance_by_year  # (P, H+1, 3, 3)
-    out = os.path.join(SNAP_DIR, f"{strategy_name}__{return_mode}.npz")
+    out = os.path.join(snap_dir, f"{strategy_name}__{return_mode}.npz")
     np.savez_compressed(out,
                         wealth=wealth.astype(np.float32),
                         spending=spend.astype(np.float32),
@@ -125,17 +126,23 @@ def run_one(strategy_name: str, policy, scn, return_mode: str,
 def main():
     n_paths = int(os.environ.get("SNAP_PATHS", "4000"))
     seed = int(os.environ.get("SNAP_SEED", "42"))
+    scenario_id = os.environ.get("SCENARIO_ID", "trial")
+    scenario_yaml = os.environ.get("SCENARIO_YAML",
+                                    os.path.join("examples", "trial.yaml"))
+    cfg_path = scenario_yaml if os.path.isabs(scenario_yaml) \
+        else os.path.join(REPO_ROOT, scenario_yaml)
+    snap_dir = os.path.join(REPO_ROOT, "snapshots", scenario_id)
+    os.makedirs(snap_dir, exist_ok=True)
     print(f"Running snapshots: {len(STRATEGIES)} strategies x "
           f"{len(RETURN_MODES)} return modes, n_paths={n_paths}")
-    cfg_path = os.path.join(os.path.dirname(__file__), "..",
-                             "examples", "trial.yaml")
+    print(f"  scenario_id={scenario_id}  yaml={cfg_path}")
+    print(f"  snap_dir={snap_dir}")
     for strat_name, build in STRATEGIES.items():
-        # One scenario per strategy (so policy build sees fresh scenario)
         scn = load_scenario(cfg_path)
         policy = build(scn)
         for mode in RETURN_MODES:
             scn_m = load_scenario(cfg_path)
-            run_one(strat_name, policy, scn_m, mode, n_paths, seed)
+            run_one(strat_name, policy, scn_m, mode, n_paths, seed, snap_dir)
     print("Done.")
 
 
