@@ -109,6 +109,12 @@ class VState:
     deferred_ord_n: np.ndarray = field(      # (P,) other ordinary pending
         default_factory=lambda: np.zeros(0))  # (Trad pulls, Roth ord/penalty)
 
+    # Per-year MAGI (modified AGI) in nominal dollars. Used for IRMAA
+    # Medicare premium surcharges, which key off MAGI from 2 years prior.
+    # Recorded each year by the step functions just before tax is paid.
+    magi_n_by_year: np.ndarray = field(      # (P, H + 1)
+        default_factory=lambda: np.zeros((0, 0)))
+
     # Rental property (optional). All paths share the same scalar config in
     # the Scenario; per-path arrays track owned-state + value + debt. When
     # no rental is configured these are zero-length placeholders.
@@ -155,6 +161,7 @@ class VState:
             deferred_lt_gain_n=zeros1.copy(),
             deferred_st_gain_n=zeros1.copy(),
             deferred_ord_n=zeros1.copy(),
+            magi_n_by_year=np.zeros((n_paths, horizon + 1)),
             rental_owned=np.zeros(n_paths, dtype=bool),
             rental_value_real=np.zeros(n_paths),
             mortgage_balance_nominal=np.zeros(n_paths),

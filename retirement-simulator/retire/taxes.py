@@ -301,3 +301,51 @@ def top_of_bracket(target_marginal_rate: float, filing_status: FilingStatus,
                 return brackets[i + 1].threshold
             return float("inf")
     raise ValueError(f"No bracket with rate {target_marginal_rate}")
+
+
+# IRMAA (Income-Related Monthly Adjustment Amount) — surcharges on
+# Medicare Part B + Part D premiums for high-income beneficiaries. Looks
+# back to MAGI from TWO years prior. Standard Part B + Part D base
+# premiums plus IRMAA surcharge are an out-of-pocket household expense
+# that we treat as a tax-like cost in the year it's paid (age 65+).
+#
+# Each tier entry is (magi_lower_threshold, total_annual_surcharge).
+# Sum of Part B IRMAA + Part D IRMAA (CMS 2024 single-filer schedule),
+# annualised. Below the lowest threshold the surcharge is $0 and the
+# user just pays standard premiums (separately).
+IRMAA_2024_SINGLE: list[tuple[float, float]] = [
+    (0.0,         0.0),
+    (103_000.0,   12.0 * (69.90 + 12.90)),   # +$994/yr
+    (129_000.0,   12.0 * (174.70 + 33.30)),  # +$2,496/yr
+    (161_000.0,   12.0 * (279.50 + 53.80)),  # +$3,999/yr
+    (193_000.0,   12.0 * (384.30 + 74.20)),  # +$5,502/yr
+    (500_000.0,   12.0 * (419.30 + 81.00)),  # +$6,003/yr
+]
+IRMAA_2024_MFJ: list[tuple[float, float]] = [
+    (0.0,         0.0),
+    (206_000.0,   12.0 * (69.90 + 12.90)),
+    (258_000.0,   12.0 * (174.70 + 33.30)),
+    (322_000.0,   12.0 * (279.50 + 53.80)),
+    (386_000.0,   12.0 * (384.30 + 74.20)),
+    (750_000.0,   12.0 * (419.30 + 81.00)),
+]
+# Medicare eligibility starts at 65; IRMAA applies from then on.
+MEDICARE_AGE = 65
+
+
+def irmaa_surcharge(magi_two_years_ago: float, age: float,
+                    filing_status: FilingStatus) -> float:
+    """Annual IRMAA surcharge in nominal dollars for a beneficiary of the
+    given age, given their MAGI from two years prior (the SSA lookback
+    rule). Returns 0 below age 65 or below the lowest threshold."""
+    if age < MEDICARE_AGE:
+        return 0.0
+    schedule = (IRMAA_2024_SINGLE if filing_status == "single"
+                else IRMAA_2024_MFJ)
+    surcharge = 0.0
+    for threshold, amount in schedule:
+        if magi_two_years_ago >= threshold:
+            surcharge = amount
+        else:
+            break
+    return surcharge

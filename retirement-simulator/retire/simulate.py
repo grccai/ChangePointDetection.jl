@@ -31,7 +31,8 @@ from .state_taxes import (StateTimeline, state_tax_vec, state_wages_tax,
 from .taxes import (TAX_2024, TaxYear, FilingStatus, Bracket,
                     progressive_tax, ltcg_tax, taxable_social_security,
                     niit_owed, required_min_distribution, top_of_bracket,
-                    RMD_DIVISORS, RMD_START_AGE)
+                    RMD_DIVISORS, RMD_START_AGE,
+                    IRMAA_2024_SINGLE, IRMAA_2024_MFJ, MEDICARE_AGE)
 from .vstate import (VState, ASSET_IDX, ASSET_ORDER, N_ASSETS,
                      deposit_taxable_st, deposit_taxable_st_split,
                      withdraw_taxable_for_spending,
@@ -101,6 +102,19 @@ def _niit_vec(magi: np.ndarray, nii: np.ndarray, fs: FilingStatus,
     th = ty.niit_threshold[fs]
     excess = np.maximum(0.0, magi - th)
     return ty.niit_rate * np.minimum(nii, excess)
+
+
+def _irmaa_vec(magi_two_yrs_ago: np.ndarray, age: float,
+               fs: FilingStatus) -> np.ndarray:
+    """Vectorised IRMAA surcharge. (P,) -> (P,) annual nominal dollars.
+    Returns zero below Medicare age."""
+    if age < MEDICARE_AGE:
+        return np.zeros_like(magi_two_yrs_ago)
+    schedule = IRMAA_2024_SINGLE if fs == "single" else IRMAA_2024_MFJ
+    out = np.zeros_like(magi_two_yrs_ago)
+    for threshold, amount in schedule:
+        out = np.where(magi_two_yrs_ago >= threshold, amount, out)
+    return out
 
 
 def _federal_tax_vec(ord_income: np.ndarray, ltcg_income: np.ndarray,
@@ -471,8 +485,23 @@ def simulate(scn: Scenario,
             # professional exception). Stack as NII alongside the year's
             # baseline NII (= ltcg + ord-div interest portion).
             rental_nii = np.maximum(0.0, rental_taxable_n)
+
+            # QBI (Section 199A) deduction: 20% of qualified rental income,
+            # capped at 20% of taxable-income-minus-net-cap-gains. We
+            # assume the rental qualifies as a Sec. 199A trade-or-business
+            # (Rev. Proc. 2019-38 safe harbor — single property, 250+
+            # hours/yr of rental services). Phaseout for SSTBs / W-2-wage
+            # tests at high income (>$241,950 single in 2024) is not
+            # modelled; QBI is applied as a flat 20% reduction of taxable
+            # rental income on the federal side. State conformity is rare
+            # (CA, OR don't conform) so state tax stays untouched.
+            sd = TAX_2024.std_deduction[fs]
+            ord_post_rent = np.maximum(0.0, ord_baseline_n + rental_taxable_n - sd)
+            qbi_cap = 0.20 * ord_post_rent
+            qbi_deduction = np.minimum(0.20 * rental_nii, qbi_cap)
+
             fed_with_rental, _ = _federal_tax_vec(
-                np.maximum(0.0, ord_baseline_n + rental_taxable_n),
+                np.maximum(0.0, ord_baseline_n + rental_taxable_n - qbi_deduction),
                 ltcg_baseline_n, ss_baseline_n, fs,
                 nii_extra=rental_nii)
             fed_baseline_recomp, _ = _federal_tax_vec(
@@ -692,6 +721,10 @@ def _step_accumulation(s: VState, scn: Scenario, age: float, year_idx: int,
     s.year_ltcg_income_n[:] = ltcg_income
     s.year_ss_nominal[:] = 0.0
 
+    # Record MAGI = ord + ltcg (no SS during accumulation). IRMAA looks
+    # back 2 years from the user's age 65+ year.
+    s.magi_n_by_year[:, year_idx] = ord_income_fed + ltcg_income
+
     # 5) Take-home and residual taxable savings
     take_home = (total_wages - trad_401k - trad_ira - roth_direct
                  - mbdr - bill_total)
@@ -872,12 +905,28 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
         ltcg=ltcg_income, filing_status=fs)
     bill_total = fed_tax + state_wage_tax_scalar + state_inv_tax
 
+    # IRMAA Medicare premium surcharge (Part B + Part D). Looks back to
+    # MAGI from 2 years ago. Treated as a tax-like cost paid out of the
+    # year's available cash flow alongside federal/state tax.
+    if age >= MEDICARE_AGE and year_idx >= 2:
+        magi_lookback = s.magi_n_by_year[:, year_idx - 2]
+        irmaa_n = _irmaa_vec(magi_lookback, age, fs)
+        bill_total = bill_total + irmaa_n
+
     # Stash baseline tax inputs so the rental block can compute incremental
     # federal tax with bracket stacking (rather than taxing rental at zero
     # baseline, which would systematically understate the marginal rate).
     s.year_ord_income_n[:] = ord_income
     s.year_ltcg_income_n[:] = ltcg_income
     s.year_ss_nominal[:] = ss_nominal
+
+    # Record this year's MAGI for the (year+2) IRMAA lookback. MAGI per
+    # IRS = AGI + tax-exempt interest; we approximate as ord_income +
+    # ltcg_income + ss_taxable.
+    ss_tax_for_magi = _ss_taxable_vec(ss_nominal, ord_income + ltcg_income,
+                                       fs, TAX_2024)
+    s.magi_n_by_year[:, year_idx] = (ord_income + ltcg_income
+                                      + ss_tax_for_magi)
 
     # 8) Pay tax: another withdrawal pass for the tax dollars. Realised
     # gains / ordinary income from this pass are deferred to next year's

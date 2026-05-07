@@ -304,26 +304,30 @@ conversions, ahead/behind-plan adjustment).
 
 | Modelled                                           | Not yet modelled                       |
 |----------------------------------------------------|----------------------------------------|
-| Federal ordinary tax brackets (2024)               | AMT                                    |
-| LTCG stacking on top of ordinary                   | QBI deduction                          |
-| NIIT (3.8%)                                        | IRMAA Medicare surcharges              |
-| Standard deduction                                 | Detailed ACA premium tax credit calc   |
-| Social Security provisional-income taxation        | HSA, FSA                               |
-| **CA / OR / WA state brackets** (2024)             | Other states' brackets                 |
-| **Multi-state residency / employment timelines**   | Part-year / non-resident apportionment   |
-| RMDs (Uniform Lifetime Table)                      | Stochastic mortality / longevity risk  |
-| Roth conversion ladder, ACA MAGI cap (cliff)       | Margin loans, leverage                 |
-| **5-year Roth conversion clock** with penalty      | Tax-loss harvesting credit carryforwards |
-| Long-term vs short-term capital gains              | Custom withdrawal smiles beyond Bengen |
-| Cohort-aggregated basis with LT preference         | Inheritance / large bequests           |
-| Dividend / coupon yield vs price appreciation      | Variable spending strategies (Guyton-Klinger) |
-| Employer 401k match                                | Backdoor Roth income phase-outs        |
-| **Mega-backdoor Roth (after-tax 401k)**            | Roth IRA / deductible IRA income limits |
-| Bengen smile retirement spending profile           | Self-employed plans (SEP, Solo 401k)   |
-| **Flexible / VPW spending with floor**             |                                        |
-| **Asset-location heuristic** (Reichenstein)        | Lump-sum bequests / inheritance        |
+| Federal ordinary tax brackets (2024)               | AMT (negligible at FIRE income levels) |
+| LTCG stacking on top of ordinary                   | Detailed ACA premium tax credit calc   |
+| NIIT (3.8%) on full NII                            | HSA, FSA                               |
+| QBI deduction (Sec. 199A) on rental net income     | Other states' brackets                 |
+| IRMAA Medicare surcharges (age 65+, 2-yr lookback) | Part-year / non-resident state apportionment |
+| Standard deduction                                 | Stochastic mortality / longevity risk  |
+| Social Security provisional-income taxation        | Margin loans, leverage                 |
+| CA / OR / WA state brackets (2024)                 | Tax-loss harvesting credit carryforwards |
+| Multi-state residency / employment timelines       | Custom withdrawal smiles beyond Bengen |
+| RMDs (Uniform Lifetime Table) on prior-year balance | Variable spending strategies (Guyton-Klinger) |
+| Roth conversion ladder, ACA MAGI cap (cliff)       | Backdoor Roth income phase-outs        |
+| 5-year Roth conversion clock with penalty          | Roth IRA / deductible IRA income limits |
+| Tax-payment-withdrawal gain/income carry-forward   | Self-employed plans (SEP, Solo 401k)   |
+| Long-term vs short-term capital gains              | Lump-sum bequests / inheritance        |
+| Cohort-aggregated basis with LT preference         |                                        |
+| Dividend / coupon yield vs price appreciation      |                                        |
+| Employer 401k match                                |                                        |
+| Mega-backdoor Roth (after-tax 401k)                |                                        |
+| Bengen smile retirement spending profile           |                                        |
+| Flexible / VPW spending with floor                 |                                        |
+| Asset-location heuristic (Reichenstein)            |                                        |
+| Rental property: stochastic appreciation, mortgage, HELOC backstop, source-state tax | |
 | CRRA + bequest objective                           |                                        |
-| **Vectorised numpy simulation engine**             |                                        |
+| Vectorised numpy simulation engine                 |                                        |
 
 ## Performance
 
@@ -347,10 +351,12 @@ vs ST tax, which is the load-bearing distinction.
 
 ## Limitations and known approximations
 
-* Roth contribution **basis** is treated as FIFO-withdrawable; the IRS
-  ordering rules separate basis, conversions (5-year clock), and earnings —
-  we do not enforce the conversion 5-year rule. Practical effect is small if
-  conversions start ≥ 5 years before the first basis withdrawal.
+* Roth withdrawals follow IRS ordering: basis (penalty-free) → conversions
+  (FIFO across years; green ones <5y old hit 10% penalty pre-59½) → earnings.
+  The Roth account-aging 5-year rule (separate from the conversion clock,
+  governing tax-free earnings withdrawals) is approximated as always
+  satisfied — practical effect is small if the first Roth contribution is
+  more than 5 years before the first earnings withdrawal.
 * The 10% early-withdrawal penalty is applied as +10% to ordinary income on
   the relevant withdrawal — this approximates the additional tax even though
   the IRS treats it as a separate line.
