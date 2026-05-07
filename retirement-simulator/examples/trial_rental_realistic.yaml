@@ -1,0 +1,177 @@
+# Trial scenario, rental-property variant with the GRANULAR cost +
+# shock model. Identical to trial_rental.yaml on every non-rental field;
+# the rental_property block decomposes the legacy 2.5% lump
+# `expense_ratio` into specific costs and adds:
+#   - property management fee (8% of gross rent)
+#   - tenant turnover events (25%/yr probability, 2 months vacant + 5%
+#     of rent in turnover costs)
+#   - capex shocks (10%/yr P, lognormal with 2% mean of property value
+#     and σ=0.6 — roughly: a typical hit costs 1-2% of value, but a
+#     1-in-30 event costs >5%)
+#   - LLC + umbrella legal/insurance ($1500/yr real)
+#   - Stochastic refinance (mean nominal 6%, AR(1) mean reversion;
+#     refi if locked - market >= 1.5pp, 2.5% closing costs, 5y cooldown)
+#
+# Compared to trial_rental.yaml, this scenario is more realistic but
+# also more expensive — expect lower median terminal wealth and slightly
+# higher ruin (the rental NOI is now ~30% lower in expectation).
+
+profile:
+  birthdate:        1989-05-05
+  start_date:       2026-05-05
+  retirement_date:  2044-05-05
+  end_of_plan_date: 2084-05-05
+  filing_status:    single
+
+income:
+  sources:
+    - {state: CA, start: 2026-05-05, end: 2026-08-20, gross_annual: 240000, growth_rate: 0.05}
+    - {state: OR, start: 2026-08-20, end: 2028-12-31, gross_annual: 146000, growth_rate: 0.05}
+    - {state: WA, start: 2026-08-20, end: 2028-12-31, gross_annual:  97400, growth_rate: 0.05}
+    - {state: CA, start: 2028-12-31, end: 2044-05-05, gross_annual: 273400, growth_rate: 0.05}
+
+state_taxes:
+  residency:
+    - {state: CA, start: 2026-05-05, end: 2026-08-20}
+    - {state: WA, start: 2026-08-20, end: 2028-12-31}
+    - {state: CA, start: 2028-12-31, end: 2084-05-05}
+
+savings:
+  rate: 0.40
+  contributions:
+    trad_401k: max
+    roth_401k: 0
+    trad_ira: 0
+    roth_ira: 7000
+    mega_backdoor_roth: max
+    employer_match_rate: 0.03
+
+spending:
+  annual_real: 100000
+  smile: bengen
+  working_annual_real:  90000
+  flexible:
+    floor_real:        50000
+    floor_change_age:  70
+    floor_after_real:  80000
+    sensitivity:       1.0
+
+initial_portfolio:
+  taxable:
+    lots:
+      - {asset: stock, market_value: 145800, cost_basis: 72900, age_years: 0.5}
+      - {asset: stock, market_value: 145800, cost_basis: 81000, age_years: 3.0}
+      - {asset: cash,  market_value:  16200, cost_basis: 16200, age_years: 0.5}
+      - {asset: cash,  market_value:  16200, cost_basis: 16200, age_years: 3.0}
+  traditional:
+    stock: 136000
+    bond:   24000
+    cash:       0
+  roth:
+    stock: 136000
+    bond:   24000
+    cash:       0
+    basis:  80000
+
+target_allocations:
+  taxable:      {stock: 0.90, bond: 0.00, cash: 0.10}
+  traditional:  {stock: 0.85, bond: 0.15, cash: 0.00}
+  roth:         {stock: 0.85, bond: 0.15, cash: 0.00}
+
+market:
+  stocks: {real_return: 0.06, vol: 0.18}
+  bonds:  {real_return: 0.02, vol: 0.06}
+  cash:   {real_return: 0.005, vol: 0.01}
+  inflation_mean: 0.025
+  inflation_vol: 0.0
+  correlation_stock_bond: 0.10
+  correlation_stock_cash: 0.0
+  correlation_bond_cash: 0.0
+
+social_security:
+  monthly_at_67: 4855
+  claim_age:     70
+
+withdrawal:
+  strategy: tax_aware
+  roth_conversion_target_bracket: 0.12
+  aca_magi_cap: 50000
+
+simulation:
+  n_paths: 5000
+  seed: 42
+  return_model: gbm
+
+inheritances:
+  - amount_real: 1000000
+    account: taxable
+    hazard:
+      profile: healthy_65
+      current_age: 65
+
+# Rental property with the granular operating-cost + shock + refinance
+# model. The legacy `expense_ratio` lump is set to 0; specific component
+# rates replace it. Order-of-magnitude calibration for a $858k SFR in
+# CA matching the v4 optimization result:
+#
+#   property tax:    1.1% of value/yr  (CA Prop 13 ~1.0-1.25%)
+#   insurance:       0.5% of value/yr  (~$4k/yr on $858k; high-fire-risk)
+#   maintenance:     0.8% of value/yr  (~$7k/yr; routine repairs)
+#   management fee:  8% of gross rent  (typical CA SFR rate)
+#   legal/ins:       $1500/yr real     (LLC fees + $1M umbrella policy)
+#
+#   tenant turnover: 25%/yr P, 2 months vacant, 5% of rent in costs.
+#   capex shocks:    10%/yr P, lognormal mean 2% of value, σ=0.6.
+#                    Expected drag: 0.20%/yr; left tail occasionally 5%+.
+#
+#   refinance:       check yearly (after 5y cooldown). Refi if locked
+#                    rate >= market + 1.5pp. Market rate AR(1) on log,
+#                    long-run mean 6% nominal, ann. log-vol 7%, alpha 0.85.
+#                    2.5% closing costs paid out of cash flow this year.
+rental_property:
+  price_real:           858000   # v4 robust optimum price
+  downpayment_frac:     0.25
+  mortgage_term_years:  30
+  mortgage_nominal_rate: 0.07
+  cap_rate:             0.06
+  expense_ratio:        0.0      # legacy lump zeroed out; granular below
+  rent_shock_vol:       0.07
+  appreciation_real_mean: 0.005
+  appreciation_real_vol:  0.10
+  correlation_with_stock: 0.30
+  correlation_with_bond:  0.10
+  location_state:       CA       # v4 robust optimum
+  ltv_max:              0.80
+  heloc_rate_nominal:   0.08
+
+  # Granular operating costs (additive on expense_ratio, which is 0 here)
+  property_tax_rate:    0.011
+  insurance_rate:       0.005
+  maintenance_rate:     0.008
+  management_fee_frac:  0.08
+  legal_insurance_real: 1500
+
+  trigger:
+    min_age:                  40.7    # v4 robust optimum
+    min_liquid_real_wealth:   769316
+    min_taxable_real_wealth:  382221
+
+  turnover:
+    annual_prob:        0.25
+    months_vacant:      2.0
+    cost_frac:          0.05
+
+  capex:
+    annual_prob:        0.10
+    mean_frac:          0.02
+    lognormal_sigma:    0.6
+
+  refinance:
+    enabled:               true
+    rate_drop_threshold:   0.015
+    closing_cost_frac:     0.025
+    cooldown_years:        5
+    new_term_years:        30
+    market_rate_mean:      0.06   # long-run nominal 30y rate
+    market_rate_log_vol:   0.07
+    market_rate_ar1_alpha: 0.85

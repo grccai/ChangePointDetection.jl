@@ -128,6 +128,15 @@ class VState:
         default_factory=lambda: np.zeros(0))
     heloc_balance_nominal: np.ndarray = field(  # (P,) drawn-against-equity
         default_factory=lambda: np.zeros(0))
+    # Mortgage rate state — set at purchase; can be updated by a refinance
+    # event in any subsequent year. Cooldown_years counts down each year
+    # after a refinance fires; refi can only fire when this hits zero.
+    mortgage_rate_nominal: np.ndarray = field(  # (P,) currently-locked rate
+        default_factory=lambda: np.zeros(0))
+    mortgage_term_years_remaining: np.ndarray = field(  # (P,) years left on note
+        default_factory=lambda: np.zeros(0, dtype=np.int32))
+    refi_cooldown: np.ndarray = field(  # (P,) years remaining before refi check
+        default_factory=lambda: np.zeros(0, dtype=np.int32))
 
     # ------- constructors -------
 
@@ -167,6 +176,9 @@ class VState:
             mortgage_balance_nominal=np.zeros(n_paths),
             mortgage_payment_nominal=np.zeros(n_paths),
             heloc_balance_nominal=np.zeros(n_paths),
+            mortgage_rate_nominal=np.zeros(n_paths),
+            mortgage_term_years_remaining=np.zeros(n_paths, dtype=np.int32),
+            refi_cooldown=np.zeros(n_paths, dtype=np.int32),
         )
         # Aggregate taxable lots into LT/ST cohorts
         for lot in portfolio.taxable.lots:

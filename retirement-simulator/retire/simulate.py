@@ -311,12 +311,18 @@ def simulate(scn: Scenario,
     # Pre-sample correlated property returns + rent shocks. Both are (P, H)
     # arrays; they're indexed once per year inside the main loop below.
     if scn.rental_property is not None:
-        property_returns_real, rent_shocks = _rental.sample_rental_paths(
+        (property_returns_real, rent_shocks, turnover_events,
+         capex_events, capex_magnitude_frac, market_rate_path
+         ) = _rental.sample_rental_paths(
             R, scn.market, scn.rental_property,
             seed=(seed or 0) + 7919)
     else:
         property_returns_real = None
         rent_shocks = None
+        turnover_events = None
+        capex_events = None
+        capex_magnitude_frac = None
+        market_rate_path = None
 
     starting_wages = scn.state_taxes.total_wages(scn.profile.start_date, 0)
     s = VState.from_portfolio(scn.initial_portfolio, P, horizon,
@@ -458,10 +464,20 @@ def simulate(scn: Scenario,
                     if property_returns_real is not None else None)
             rs_y = (rent_shocks[:, y]
                     if rent_shocks is not None else None)
+            to_y = (turnover_events[:, y]
+                    if turnover_events is not None else None)
+            cx_y = (capex_magnitude_frac[:, y]
+                    if capex_magnitude_frac is not None else None)
+            mr_y = (market_rate_path[:, y]
+                    if market_rate_path is not None else None)
             (rental_taxable_real, rental_net_cash_real,
-             _interest_real) = _rental.step_rental_year(s, rp,
-                                                          property_return_real=pr_y,
-                                                          rent_shock=rs_y)
+             _interest_real) = _rental.step_rental_year(
+                 s, rp,
+                 property_return_real=pr_y,
+                 rent_shock=rs_y,
+                 turnover_event=to_y,
+                 capex_magnitude_frac=cx_y,
+                 market_rate=mr_y)
             # Rental tax: Federal ordinary on rental_taxable_income; state
             # is sourced to the property's location_state regardless of
             # residency.

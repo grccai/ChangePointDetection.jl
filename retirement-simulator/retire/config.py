@@ -312,6 +312,59 @@ class RentalPurchaseTrigger:
 
 
 @dataclass
+class TenantTurnoverModel:
+    """Discrete tenant-turnover events. Each year, with probability
+    `annual_prob`, the tenant moves out, costing `months_vacant/12`
+    of annual gross rent (lost income) plus a one-time turnover cost
+    (cleaning, repaint, listing fees, broker commission) sized as
+    `cost_frac` × annual gross rent. Set `annual_prob=0` to disable."""
+    annual_prob: float = 0.0
+    months_vacant: float = 2.0
+    cost_frac: float = 0.05    # fraction of annual gross rent
+
+
+@dataclass
+class CapexShockModel:
+    """Big-ticket repair / capex events. Each year, with probability
+    `annual_prob`, a capex event occurs whose magnitude is a fraction of
+    property value drawn from a lognormal with mean `mean_frac` (i.e.,
+    expected cost = mean_frac × property_value_real) and lognormal
+    sigma `lognormal_sigma`. Set `annual_prob=0` to disable.
+
+    Sigma controls right-tail heaviness: 0.6 gives a moderate tail; 1.0
+    gives substantial tail (1-in-20 events ~5x the mean)."""
+    annual_prob: float = 0.0
+    mean_frac: float = 0.02       # expected cost as fraction of property value
+    lognormal_sigma: float = 0.6
+
+
+@dataclass
+class RefinanceModel:
+    """Stochastic refinance option. Each year a per-path 30-year nominal
+    market mortgage rate is sampled from an AR(1) on log-rate around
+    `market_rate_mean`. If `enabled` and the cooldown has expired and
+    (locked_rate − market_rate) ≥ `rate_drop_threshold`, the loan is
+    refinanced into the market rate at a closing cost of
+    `closing_cost_frac` × current balance (paid out of the year's cash
+    flow, like a one-time capex hit). New mortgage runs `new_term_years`
+    on the unchanged remaining principal at the market rate. Cooldown
+    of `cooldown_years` before another refi check.
+
+    `market_rate_log_vol` is the annual stdev of log-rate innovations;
+    `market_rate_ar1_alpha` is the AR(1) persistence (1.0 = random walk,
+    0.85 = strong mean reversion). Defaults give long-run mean 7%, ~0.5pp
+    annual rate vol, mean reversion half-life ~5y."""
+    enabled: bool = False
+    rate_drop_threshold: float = 0.015     # require 1.5pp drop to refi
+    closing_cost_frac: float = 0.025       # 2.5% of remaining balance
+    cooldown_years: int = 5
+    new_term_years: int = 30
+    market_rate_mean: float = 0.07         # long-run nominal 30y rate
+    market_rate_log_vol: float = 0.07      # annual stdev of log-rate
+    market_rate_ar1_alpha: float = 0.85
+
+
+@dataclass
 class RentalProperty:
     """Rental property modeled as a separate asset on the balance sheet.
 
@@ -320,35 +373,62 @@ class RentalProperty:
                                    log-returns this year (rho_s, rho_b)
       property_value_real       *= (1 + property_return)
       rent_shock                ~ N(0, rent_shock_vol)   per year
-      noi_real                   = (cap_rate * (1 + rent_shock)
-                                    - expense_ratio) * property_value_real
-      mortgage_payment_nominal   = locked annuity payment (fixed at purchase)
-      mortgage_interest_t        = balance_t * rate_n
+      gross_rent_real            = cap_rate * (1 + rent_shock)
+                                    * property_value_real
+                                    * (1 - turnover_vacancy_frac)
+      operating_costs_real       = (expense_ratio + property_tax_rate
+                                    + insurance_rate + maintenance_rate)
+                                   * property_value_real
+                                   + management_fee_frac * gross_rent_real
+                                   + legal_insurance_real
+                                   + turnover_event_cost
+                                   + capex_event_cost
+                                   + refi_closing_cost (if refi'd this year)
+      noi_real                   = gross_rent_real - operating_costs_real
+      mortgage_payment_nominal   = annuity payment (re-set on each refi)
+      mortgage_interest_t        = balance_t * locked_rate_t
       taxable_rental_income      = noi_real - mortgage_interest_real
-                                   (mortgage interest deductible; depreciation
-                                   NOT modelled in v1)
+                                   (mortgage interest deductible;
+                                    depreciation NOT modelled)
       net_cash_flow_real         = noi_real - mortgage_payment_real
                                     - heloc_interest_real
-      after-tax cash             -> deposited to taxable cash sleeve
+
+    The granular operating fields (property_tax_rate, insurance_rate,
+    maintenance_rate, management_fee_frac, legal_insurance_real) are
+    additive on top of the legacy `expense_ratio` lump. Old scenarios
+    keep `expense_ratio=0.025` and granular fields at 0; new scenarios
+    can split out the components and set `expense_ratio=0`.
 
     Tax sourcing: rental taxable income is taxed by `location_state`
-    (source-based), not residency. Federal tax applies as ordinary.
+    (source-based), not residency. Federal tax applies as ordinary
+    (with QBI 20% deduction for safe-harbor-qualifying rentals).
 
     Borrow-against-equity (no sale event):
       accessible_equity = max(0, ltv_max * value_n - mortgage_n - heloc_n)
-      When the simulator would otherwise mark a path failed, draw up to
-      `accessible_equity` from a HELOC at `heloc_rate_nominal` instead.
-      Subsequent years' cash flow services HELOC interest first.
+      The HELOC backstop is drawn for end-of-year spending shortfalls.
     """
     # Purchase economics
     price_real: float
     downpayment_frac: float = 0.25
     mortgage_term_years: int = 30
     mortgage_nominal_rate: float = 0.07
-    # Operating economics (fractions of property_value_real)
+    # Operating economics — legacy lump (kept for back-compat)
     cap_rate: float = 0.05
     expense_ratio: float = 0.02   # maint + insurance + property tax + vacancy
     rent_shock_vol: float = 0.05  # annual stdev of multiplicative rent shock
+    # Operating economics — granular components (default 0; opt-in).
+    # Each `*_rate` is a fraction of property_value_real / yr.
+    property_tax_rate: float = 0.0
+    insurance_rate: float = 0.0
+    maintenance_rate: float = 0.0
+    management_fee_frac: float = 0.0     # fraction of GROSS rent
+    legal_insurance_real: float = 0.0    # fixed real $/yr (LLC + umbrella)
+    # Tenant turnover events (default no-op)
+    turnover: TenantTurnoverModel = field(default_factory=TenantTurnoverModel)
+    # Big-ticket capex shocks (default no-op)
+    capex: CapexShockModel = field(default_factory=CapexShockModel)
+    # Stochastic refinance (default disabled)
+    refinance: RefinanceModel = field(default_factory=RefinanceModel)
     # Property appreciation (excess of CPI), stochastic, correlated with stock
     # and bond log-returns.
     appreciation_real_mean: float = 0.005   # excess of CPI
@@ -568,6 +648,10 @@ def load_scenario(path: str | Path) -> Scenario:
         # as the new `appreciation_real_mean` (deterministic if no _vol set).
         appr_mean = float(rp_raw.get("appreciation_real_mean",
                                        rp_raw.get("appreciation_real", 0.005)))
+        # Optional nested blocks for the granular operating-cost model.
+        to_raw = rp_raw.get("turnover", {}) or {}
+        cx_raw = rp_raw.get("capex", {}) or {}
+        rf_raw = rp_raw.get("refinance", {}) or {}
         rental = RentalProperty(
             price_real=float(rp_raw["price_real"]),
             downpayment_frac=float(rp_raw.get("downpayment_frac", 0.25)),
@@ -576,6 +660,31 @@ def load_scenario(path: str | Path) -> Scenario:
             cap_rate=float(rp_raw.get("cap_rate", 0.05)),
             expense_ratio=float(rp_raw.get("expense_ratio", 0.02)),
             rent_shock_vol=float(rp_raw.get("rent_shock_vol", 0.05)),
+            property_tax_rate=float(rp_raw.get("property_tax_rate", 0.0)),
+            insurance_rate=float(rp_raw.get("insurance_rate", 0.0)),
+            maintenance_rate=float(rp_raw.get("maintenance_rate", 0.0)),
+            management_fee_frac=float(rp_raw.get("management_fee_frac", 0.0)),
+            legal_insurance_real=float(rp_raw.get("legal_insurance_real", 0.0)),
+            turnover=TenantTurnoverModel(
+                annual_prob=float(to_raw.get("annual_prob", 0.0)),
+                months_vacant=float(to_raw.get("months_vacant", 2.0)),
+                cost_frac=float(to_raw.get("cost_frac", 0.05)),
+            ),
+            capex=CapexShockModel(
+                annual_prob=float(cx_raw.get("annual_prob", 0.0)),
+                mean_frac=float(cx_raw.get("mean_frac", 0.02)),
+                lognormal_sigma=float(cx_raw.get("lognormal_sigma", 0.6)),
+            ),
+            refinance=RefinanceModel(
+                enabled=bool(rf_raw.get("enabled", False)),
+                rate_drop_threshold=float(rf_raw.get("rate_drop_threshold", 0.015)),
+                closing_cost_frac=float(rf_raw.get("closing_cost_frac", 0.025)),
+                cooldown_years=int(rf_raw.get("cooldown_years", 5)),
+                new_term_years=int(rf_raw.get("new_term_years", 30)),
+                market_rate_mean=float(rf_raw.get("market_rate_mean", 0.07)),
+                market_rate_log_vol=float(rf_raw.get("market_rate_log_vol", 0.07)),
+                market_rate_ar1_alpha=float(rf_raw.get("market_rate_ar1_alpha", 0.85)),
+            ),
             appreciation_real_mean=appr_mean,
             appreciation_real_vol=float(rp_raw.get("appreciation_real_vol", 0.10)),
             correlation_with_stock=float(rp_raw.get("correlation_with_stock", 0.30)),

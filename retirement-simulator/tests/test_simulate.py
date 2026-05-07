@@ -372,3 +372,141 @@ def test_withdraw_roth_basis_first_no_penalty():
     assert math.isclose(proc[0], 30_000.0, rel_tol=1e-9)
     assert pen[0] == 0.0
     assert ord_add[0] == 0.0
+
+
+# ---------- Rental property: granular cost + shock model ----------
+
+def _rental_scenario(rp_overrides=None):
+    """Minimal scenario with a deterministic rental purchase at year 0
+    (trigger fires immediately). Used to isolate rental-only effects."""
+    from retire.config import (Profile, Scenario, Savings, Spending,
+                                MarketConfig, TargetAllocations,
+                                Allocation, RentalProperty,
+                                RentalPurchaseTrigger,
+                                Contributions, SocialSecurity,
+                                WithdrawalPolicy, SimulationParams)
+    from retire.accounts import Portfolio, Asset, Lot
+    from retire.returns import AssetParams
+    from retire.state_taxes import StateTimeline, ResidencyPeriod, IncomeSource
+
+    profile = Profile(
+        birthdate=dt.date(1980, 1, 1),
+        start_date=dt.date(2026, 1, 1),
+        retirement_date=dt.date(2030, 1, 1),
+        end_of_plan_date=dt.date(2050, 1, 1),
+        filing_status="single")
+    timeline = StateTimeline()
+    timeline.residency.append(ResidencyPeriod(
+        state="WA", start=dt.date(2026, 1, 1), end=dt.date(2050, 1, 1)))
+    timeline.income_sources.append(IncomeSource(
+        state="WA", start=dt.date(2026, 1, 1), end=dt.date(2030, 1, 1),
+        gross_annual=200_000, growth_rate=0.0))
+    portfolio = Portfolio()
+    # Pre-fund taxable with $200k cash so the wealth-conditional trigger
+    # fires at year 0 (the $500k property's $125k downpayment is funded).
+    portfolio.taxable.lots = [
+        Lot(asset=Asset.CASH, market_value=200_000, cost_basis=200_000,
+            age_years=2.0)]
+    portfolio.traditional.balances[Asset.STOCK] = 1_500_000
+    portfolio.roth.balances[Asset.STOCK] = 100_000
+    portfolio.roth.roth_basis = 50_000
+
+    rp = RentalProperty(
+        price_real=500_000, downpayment_frac=0.25,
+        mortgage_term_years=30, mortgage_nominal_rate=0.07,
+        cap_rate=0.06, expense_ratio=0.0, rent_shock_vol=0.0,
+        location_state="WA",
+        trigger=RentalPurchaseTrigger(
+            min_age=0.0, min_liquid_real_wealth=0.0,
+            min_taxable_real_wealth=0.0))
+    if rp_overrides:
+        for k, v in rp_overrides.items():
+            setattr(rp, k, v)
+
+    return Scenario(
+        profile=profile, state_taxes=timeline,
+        savings=Savings(rate=0.0, contributions=Contributions()),
+        spending=Spending(annual_real=40_000, smile="flat"),
+        initial_portfolio=portfolio,
+        target_allocations=TargetAllocations(
+            taxable=Allocation(0, 0, 1),
+            traditional=Allocation(1, 0, 0),
+            roth=Allocation(1, 0, 0)),
+        market=MarketConfig(
+            stocks=AssetParams(real_return=0.0, vol=0.0),
+            bonds=AssetParams(real_return=0.0, vol=0.0),
+            cash=AssetParams(real_return=0.0, vol=0.0),
+            inflation_mean=0.0, inflation_vol=0.0),
+        social_security=SocialSecurity(),
+        withdrawal=WithdrawalPolicy(),
+        simulation=SimulationParams(n_paths=200, seed=1, return_model="gbm"),
+        inheritances=[],
+        rental_property=rp)
+
+
+def test_rental_management_fee_reduces_terminal_wealth():
+    """Adding an 8% management fee should make every path worse."""
+    from retire.simulate import simulate
+    no_fee = simulate(_rental_scenario())
+    with_fee = simulate(_rental_scenario({"management_fee_frac": 0.08}))
+    # Median terminal must drop (rental cash flow is reduced; lifetime
+    # taxes also drop slightly because NOI is lower, but the fee dominates).
+    q_no = no_fee.terminal_quantiles([0.5])[0.5]
+    q_yes = with_fee.terminal_quantiles([0.5])[0.5]
+    assert q_yes < q_no, f"mgmt fee should reduce terminal: {q_yes} >= {q_no}"
+
+
+def test_rental_capex_shock_widens_left_tail():
+    """Capex Bernoulli×lognormal hits should fatten the left tail without
+    much affecting the median (rare events)."""
+    from retire.simulate import simulate
+    from retire.config import CapexShockModel
+    base = simulate(_rental_scenario())
+    shocked = simulate(_rental_scenario({
+        "capex": CapexShockModel(annual_prob=0.20, mean_frac=0.04,
+                                  lognormal_sigma=0.8)}))
+    q_base = base.terminal_quantiles([0.05, 0.5])
+    q_shock = shocked.terminal_quantiles([0.05, 0.5])
+    # Lower 5th percentile should drop materially; median changes less.
+    assert q_shock[0.05] < q_base[0.05]
+
+
+def test_rental_refinance_drops_locked_rate_when_market_falls():
+    """Force market rate well below the locked rate; verify a refi fires
+    and the per-path mortgage_rate_nominal drops."""
+    from retire.simulate import simulate
+    from retire.config import RefinanceModel
+    rp_over = {
+        "mortgage_nominal_rate": 0.08,
+        "refinance": RefinanceModel(
+            enabled=True, rate_drop_threshold=0.005,
+            closing_cost_frac=0.01, cooldown_years=1, new_term_years=30,
+            market_rate_mean=0.04, market_rate_log_vol=1e-9,
+            market_rate_ar1_alpha=1.0)}
+    scn = _rental_scenario(rp_over)
+    scn.simulation.n_paths = 50
+    r = simulate(scn)
+    # We can't observe the per-path locked rate from PathResult, so check
+    # via terminal wealth: with refi -> lower payment -> higher terminal
+    # vs the same scenario with refi disabled.
+    rp_off = dict(rp_over)
+    rp_off["refinance"] = RefinanceModel(enabled=False)
+    scn_off = _rental_scenario(rp_off)
+    scn_off.simulation.n_paths = 50
+    r_off = simulate(scn_off)
+    q_on = r.terminal_quantiles([0.5])[0.5]
+    q_off = r_off.terminal_quantiles([0.5])[0.5]
+    assert q_on > q_off, f"refi should help: {q_on} <= {q_off}"
+
+
+def test_rental_turnover_reduces_rent():
+    """High-probability turnover with long vacancy should reduce terminal."""
+    from retire.simulate import simulate
+    from retire.config import TenantTurnoverModel
+    base = simulate(_rental_scenario())
+    churn = simulate(_rental_scenario({
+        "turnover": TenantTurnoverModel(annual_prob=1.0, months_vacant=4.0,
+                                         cost_frac=0.10)}))
+    q_base = base.terminal_quantiles([0.5])[0.5]
+    q_churn = churn.terminal_quantiles([0.5])[0.5]
+    assert q_churn < q_base
