@@ -148,11 +148,13 @@ def _bm_v4_gbm(scn):
 
 
 def _bm_v4_robust(scn):
-    """v4 bodie_merton + rental robust [gbm,hist] optimum.
-    Parameters set once /tmp/opt_v4_bm_robust.log lands; placeholder
-    uses bm_v4_gbm so the snapshot script doesn't error if invoked
-    early."""
-    return _bm_v4_gbm(scn)
+    """v4 bodie_merton + rental robust [gbm,hist] optimum (worst-case
+    reward 4.521; ruin 0.38%/1.24%). The optimum's Merton constant was
+    50.95% target stock-of-total — back-solving gamma = 3.33 at the
+    trial market. r_hc = 3% (default; not printed)."""
+    retirement_age = scn.profile.retirement_age
+    x = [3.33, 0.03, 0.1301, 3.0, 2.0, 0.9622]
+    return build_bodie_merton_policy(x, scn, retirement_age=retirement_age)
 
 
 STRATEGIES_V4_RENTAL = {
@@ -172,8 +174,11 @@ STRATEGIES_V4_RENTAL = {
         dict(price_real=850_270, location_state="TX",
              min_age=44.9, min_liquid=807_710, min_taxable=401_488),
     ),
-    # bodie_merton_v4_robust is added below once that optimizer run lands;
-    # see _bm_v4_robust for the (currently placeholder) parameters.
+    "bodie_merton_v4_robust": (
+        _bm_v4_robust,
+        dict(price_real=858_081, location_state="CA",
+             min_age=40.7, min_liquid=769_316, min_taxable=382_221),
+    ),
 }
 
 RETURN_MODES = ["gbm", "historical", "historical_ath", "historical_stretched_ath"]

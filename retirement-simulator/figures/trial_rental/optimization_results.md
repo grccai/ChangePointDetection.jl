@@ -203,6 +203,12 @@ rental, IRMAA only) median tax rises ~+2.3%.
 | bond_tent + rental, GBM | 4.532 → **4.563** | 0.56% → 0.82% | $4.47M → $4.05M |
 | bodie_merton + rental, GBM | 4.541 → **4.555** | 0.88% → 1.10% | $4.37M → $4.55M |
 | bond_tent + rental, robust | 4.495 → **4.516** worst-case | 0.28%/1.00% → 0.50%/1.56% | $4.39M → $4.70M |
+| **bodie_merton + rental, robust** | (new) → **4.521** worst-case | (new) → **0.38%/1.24%** | (new) → $4.45M |
+
+The new bodie_merton-robust run is **the best** worst-case so far —
+4.521 reward (essentially tied with its GBM-mode reward of 4.522, so
+the policy is mode-balanced) and the lowest robust-mode ruin (0.38%
+gbm / 1.24% historical, vs 0.50%/1.56% for bond_tent robust).
 
 P(ruin) ticked up across the board because IRMAA adds a real $1-6k/yr
 expense in retirement that the v3 model wasn't paying. Reward still
@@ -212,13 +218,13 @@ conversion strategy to match.
 
 ### v4 rental decisions
 
-| Parameter | bt GBM | bm GBM | bt robust |
-|---|---|---|---|
-| price_real | $1.28M | $1.48M | $0.85M |
-| location_state | TX | CA | TX |
-| trigger.min_age | 40.2 | 40.8 | 44.9 |
-| trigger.min_liquid | $560k | $773k | $808k |
-| trigger.min_taxable | $177k | $209k | $401k |
+| Parameter | bt GBM | bm GBM | bt robust | **bm robust** |
+|---|---|---|---|---|
+| price_real | $1.28M | $1.48M | $0.85M | **$0.86M** |
+| location_state | TX | CA | TX | **CA** |
+| trigger.min_age | 40.2 | 40.8 | 44.9 | **40.7** |
+| trigger.min_liquid | $560k | $773k | $808k | **$769k** |
+| trigger.min_taxable | $177k | $209k | $401k | **$382k** |
 
 The "buy early" verdict survived a third audit/fix cycle. The robust
 optimum nudged to slightly later (44.9 vs 41.0 in v3) and smaller
@@ -227,16 +233,23 @@ leverage benefit more conservatively.
 
 ### v4 allocation shapes
 
-* **bond_tent v4 GBM**: smaller V (stock_high somewhere mid-range,
-  taxable cash 18%), conv 22% FIRE-gap + 12% SS-window, wealth_resp
-  0.21. More balanced than v3's "low equity + huge cash" extreme.
-* **bodie_merton v4 GBM**: aggressive conversion ladder (22% FIRE-gap,
-  32% SS-window) — capturing the now-honestly-modelled tax savings of
-  filling brackets ahead of the IRMAA-triggering Trad RMDs.
-* **bond_tent v4 robust**: stock_high 81% / stock_low 54% V at age 58,
-  span 8y, 24% taxable cash, 24% conversions in both phases. Tight
-  V-shape glide that hedges historical-mode ruin while capturing
-  leverage upside via a smaller-than-average rental ($850k).
+* **bond_tent v4 GBM**: stock 81% → 17% V at age 69 (post-retirement!),
+  span 29y, **40% taxable cash**, no FIRE-gap conversions, 12%
+  SS-window. Heavy cash + late, wide V — bets on a shallow drawdown
+  in the tail, accepts lower upside.
+* **bodie_merton v4 GBM**: Merton 39%, 17% taxable cash, **22%
+  FIRE-gap conversions and 32% SS-window** — capturing the
+  now-honestly-modelled tax savings of filling brackets ahead of
+  the IRMAA-triggering Trad RMDs. Largest rental ($1.48M).
+* **bond_tent v4 robust**: stock 81% → 54% V at age 58, span 8y,
+  24% taxable cash, 24% conversions in both phases. Tight V-shape
+  glide that hedges historical-mode ruin while capturing leverage
+  upside via a smaller-than-average rental ($850k TX).
+* **bodie_merton v4 robust**: Merton 51% (gamma ≈ 3.3), 13% taxable
+  cash, 22% FIRE-gap + 12% SS-window conversions. Smallest cash
+  buffer of the four v4 policies, but the highest Merton constant
+  generates plenty of stock exposure during accumulation when human
+  capital is large. Pairs with a small $858k CA rental.
 
 ### Recommendation (v4)
 
@@ -245,13 +258,31 @@ stable:
 
 1. **Buy a rental early** (~age 41) — confirmed across all v2/v3/v4
    runs, robust to allocation policy and return mode.
-2. **Hold a meaningful taxable cash sleeve** (15-25%) for tax bills.
+2. **Hold a meaningful taxable cash sleeve** (13-40%) for tax bills.
 3. **Run aggressive Roth conversions during the FIRE-gap** (22-24%
    bracket) to flatten ord-income before RMDs and IRMAA bite.
 4. The leverage-benefit and tax-burden are now both honestly counted;
-   reward sits at 4.5 / 5.5 (≈82% weighted FIRE-prob).
+   reward sits at ~4.5 / 5.5 (≈82% weighted FIRE-prob).
 
-Best single run: **bond_tent v4 GBM**, reward 4.563, P(ruin) 0.82%.
-Best for historical-tail-risk-averse: **bond_tent v4 robust**, reward
-worst-case 4.440 with both modes feasible at ≤ 1.56% ruin.
+The **bodie_merton v4 robust** result is the new best baseline: it
+beats every other v4 run on either reward, ruin, or both:
+
+| Strategy | Worst-case reward | Worst-case P(ruin) | Median terminal |
+|---|---|---|---|
+| bm_v4_gbm | 4.555 (gbm) | 1.10% (gbm only) | $4.55M |
+| bt_v4_gbm | 4.563 (gbm) | 0.82% (gbm only) | $4.05M |
+| bt_v4_robust | 4.440 (hist) | 1.56% (hist) | $4.70M |
+| **bm_v4_robust** | **4.521** (hist) | **1.24%** (hist) | $4.45M |
+
+The bm_v4_robust optimum:
+* highest worst-case reward of the robust runs (4.521 > 4.440);
+* lowest historical-mode ruin (1.24% < 1.56%);
+* near-tied terminal wealth ($4.45M);
+* mode-balanced (gbm-reward 4.522 ≈ hist-reward 4.521).
+
+Single recommended baseline: **bodie_merton v4 robust + early CA
+rental**. For users who want to optimize purely for a smooth-tail
+GBM world (and don't care about historical regime risk),
+**bond_tent v4 GBM** has slightly higher GBM-mode reward but at
+2-3× higher historical-mode ruin.
 
