@@ -177,3 +177,81 @@ For a single recommendation: **bond_tent v3 GBM** has the best balance
 users worried about historical-mode regimes, **bond_tent v3 robust**
 has the lowest ruin (0.28% / 1.00%) but slightly lower upside.
 
+## v4 (post QBI + IRMAA)
+
+Two more tax-accounting fixes added (commit `5e623d0`):
+* **QBI (Sec. 199A) deduction** — 20% federal deduction on positive
+  rental net income, capped at 20% of taxable income. Assumes the
+  rental qualifies under the Rev. Proc. 2019-38 safe harbor.
+* **IRMAA Medicare surcharges** — Part B + Part D surcharges from
+  age 65+, looking back to MAGI from 2 years prior. 2024 single
+  schedule: $103k / $129k / $161k / $193k / $500k thresholds with
+  annual surcharges of $994 / $2,496 / $3,999 / $5,502 / $6,003.
+* AMT — left unmodelled; tentative-min-tax 26-28% on AMTI is
+  dominated by the regular ordinary brackets which top out at 32%
+  in the same range, so AMT is essentially never triggered for
+  typical FIRE income profiles.
+
+QBI partially offsets IRMAA on the rental scenario (~-0.9% net change
+in median lifetime tax on `trial_rental.yaml`). On `trial.yaml` (no
+rental, IRMAA only) median tax rises ~+2.3%.
+
+### v3 → v4 results
+
+| Run | Reward (v3 → v4) | P(ruin) (v3 → v4) | Median terminal (v3 → v4) |
+|---|---|---|---|
+| bond_tent + rental, GBM | 4.532 → **4.563** | 0.56% → 0.82% | $4.47M → $4.05M |
+| bodie_merton + rental, GBM | 4.541 → **4.555** | 0.88% → 1.10% | $4.37M → $4.55M |
+| bond_tent + rental, robust | 4.495 → **4.516** worst-case | 0.28%/1.00% → 0.50%/1.56% | $4.39M → $4.70M |
+
+P(ruin) ticked up across the board because IRMAA adds a real $1-6k/yr
+expense in retirement that the v3 model wasn't paying. Reward still
+went up slightly because QBI savings on rental NOI dominate IRMAA
+hits at the median path, and the optimizer adjusted allocation +
+conversion strategy to match.
+
+### v4 rental decisions
+
+| Parameter | bt GBM | bm GBM | bt robust |
+|---|---|---|---|
+| price_real | $1.28M | $1.48M | $0.85M |
+| location_state | TX | CA | TX |
+| trigger.min_age | 40.2 | 40.8 | 44.9 |
+| trigger.min_liquid | $560k | $773k | $808k |
+| trigger.min_taxable | $177k | $209k | $401k |
+
+The "buy early" verdict survived a third audit/fix cycle. The robust
+optimum nudged to slightly later (44.9 vs 41.0 in v3) and smaller
+($850k vs $631k), trading off the tax-burden risk against the
+leverage benefit more conservatively.
+
+### v4 allocation shapes
+
+* **bond_tent v4 GBM**: smaller V (stock_high somewhere mid-range,
+  taxable cash 18%), conv 22% FIRE-gap + 12% SS-window, wealth_resp
+  0.21. More balanced than v3's "low equity + huge cash" extreme.
+* **bodie_merton v4 GBM**: aggressive conversion ladder (22% FIRE-gap,
+  32% SS-window) — capturing the now-honestly-modelled tax savings of
+  filling brackets ahead of the IRMAA-triggering Trad RMDs.
+* **bond_tent v4 robust**: stock_high 81% / stock_low 54% V at age 58,
+  span 8y, 24% taxable cash, 24% conversions in both phases. Tight
+  V-shape glide that hedges historical-mode ruin while capturing
+  leverage upside via a smaller-than-average rental ($850k).
+
+### Recommendation (v4)
+
+Across four full audit/fix iterations, the qualitative answer is now
+stable:
+
+1. **Buy a rental early** (~age 41) — confirmed across all v2/v3/v4
+   runs, robust to allocation policy and return mode.
+2. **Hold a meaningful taxable cash sleeve** (15-25%) for tax bills.
+3. **Run aggressive Roth conversions during the FIRE-gap** (22-24%
+   bracket) to flatten ord-income before RMDs and IRMAA bite.
+4. The leverage-benefit and tax-burden are now both honestly counted;
+   reward sits at 4.5 / 5.5 (≈82% weighted FIRE-prob).
+
+Best single run: **bond_tent v4 GBM**, reward 4.563, P(ruin) 0.82%.
+Best for historical-tail-risk-averse: **bond_tent v4 robust**, reward
+worst-case 4.440 with both modes feasible at ≤ 1.56% ruin.
+
