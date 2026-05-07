@@ -356,8 +356,14 @@ def simulate(scn: Scenario,
         # withdrawal are taxed in the same year as a separate adjustment.
         if scn.rental_property is not None:
             rp = scn.rental_property
-            liquid_real = s.real_wealth[:, y]
-            taxable_real = s.taxable_total() / s.cumulative_inflation
+            # Liquid wealth = ACCOUNTS only (taxable + Trad + Roth), excluding
+            # rental equity which is illiquid for the purposes of funding a
+            # downpayment. Both gates use the same (current) cum_infl deflator
+            # so the trigger arithmetic stays internally consistent regardless
+            # of the year's inflation tick.
+            cum_infl_now = s.cumulative_inflation
+            liquid_real = s.total_value() / cum_infl_now
+            taxable_real = s.taxable_total() / cum_infl_now
             buyers = _rental.trigger_fires(s, rp, age, liquid_real, taxable_real)
             if buyers.any():
                 dp_real = _rental.execute_purchase(s, rp, buyers, y)
@@ -433,15 +439,32 @@ def simulate(scn: Scenario,
             # is sourced to the property's location_state regardless of
             # residency.
             rental_taxable_n = rental_taxable_real * s.cumulative_inflation
-            # Stack rental income on top of zero baseline for the marginal
-            # tax (approximation — full bracket effect would require
-            # recomputing the year's federal/state tax with rental folded in).
-            fed_rent_tax, _ = _federal_tax_vec(
-                rental_taxable_n,
-                np.zeros(P), np.zeros(P), fs)
+            # Federal: incremental tax of stacking rental on top of the year's
+            # baseline ordinary income (wages / RMDs / conversions / dividends
+            # / capital gains from the spending withdrawal). Captures the true
+            # bracket / NIIT margin instead of the prior 0-baseline
+            # approximation that under-stated tax in working years and RMD
+            # years. Rental cash flow can also be negative (operating loss);
+            # we treat negative rental income as a deduction that lowers the
+            # year's federal tax bill (Schedule-E loss limited only by the
+            # already-paid baseline — passive-activity loss limits are not
+            # modelled, so this slightly *overstates* the deduction in some
+            # high-AGI cases).
+            ord_baseline_n = s.year_ord_income_n
+            ltcg_baseline_n = s.year_ltcg_income_n
+            ss_baseline_n = s.year_ss_nominal
+            fed_with_rental, _ = _federal_tax_vec(
+                np.maximum(0.0, ord_baseline_n + rental_taxable_n),
+                ltcg_baseline_n, ss_baseline_n, fs)
+            fed_baseline_recomp, _ = _federal_tax_vec(
+                ord_baseline_n, ltcg_baseline_n, ss_baseline_n, fs)
+            fed_rent_tax = fed_with_rental - fed_baseline_recomp
+            # State: rental income is *source-based* to the property's state,
+            # not residency. Compute standalone (no stacking with residency-
+            # sourced income, which is taxed by a different state).
             state_rent_tax = state_tax_vec(
                 state=rp.location_state,
-                ordinary_income=rental_taxable_n,
+                ordinary_income=np.maximum(0.0, rental_taxable_n),
                 ltcg_income=np.zeros(P),
                 filing_status=fs)
             # Cap-gains tax on the purchase sale (this year only)
@@ -495,6 +518,10 @@ def simulate(scn: Scenario,
         # Record property equity in real $: net of mortgage AND HELOC. This
         # is the "if I sold today and paid off both the mortgage and the
         # HELOC" residual, which is the honest contribution to total wealth.
+        # Fold this same equity into real_wealth so all downstream consumers
+        # (FIRE-prob optimizer measure, terminal_real_wealth, StateSummary's
+        # median, visualizations) see the household's true balance-sheet
+        # wealth — *not* accounts only.
         if scn.rental_property is not None and s.rental_owned.any():
             cum_infl = s.cumulative_inflation
             eq_real = (s.rental_value_real
@@ -502,6 +529,7 @@ def simulate(scn: Scenario,
                           + s.heloc_balance_nominal) / cum_infl)
             eq_real = np.where(s.rental_owned, np.maximum(0.0, eq_real), 0.0)
             s.real_equity_by_year[:, y + 1] = eq_real
+            s.real_wealth[:, y + 1] += eq_real
         if age >= retirement_age:
             # Ruin: taxable+401k+roth all depleted AND no HELOC capacity left.
             # When rental is configured, the equity backstop softens ruin.
@@ -635,6 +663,12 @@ def _step_accumulation(s: VState, scn: Scenario, age: float, year_idx: int,
         ltcg=qual_div, filing_status=fs)
     state_tax_total = state_wage_tax_scalar + state_inv_tax  # (P,)
     bill_total = fed_tax + state_tax_total
+
+    # Stash baseline tax inputs so the rental block (run after this step)
+    # can compute incremental federal tax with bracket stacking.
+    s.year_ord_income_n[:] = ord_income_fed
+    s.year_ltcg_income_n[:] = ltcg_income
+    s.year_ss_nominal[:] = 0.0
 
     # 5) Take-home and residual taxable savings
     take_home = (total_wages - trad_401k - trad_ira - roth_direct
@@ -789,6 +823,13 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
         ltcg=ltcg_income, filing_status=fs)
     bill_total = fed_tax + state_wage_tax_scalar + state_inv_tax
 
+    # Stash baseline tax inputs so the rental block can compute incremental
+    # federal tax with bracket stacking (rather than taxing rental at zero
+    # baseline, which would systematically understate the marginal rate).
+    s.year_ord_income_n[:] = ord_income
+    s.year_ltcg_income_n[:] = ltcg_income
+    s.year_ss_nominal[:] = ss_nominal
+
     # 8) Pay tax: another withdrawal pass for the tax dollars
     paid, lt_g2, st_g2 = withdraw_taxable_for_spending(s, bill_total)
     remaining_tax = bill_total - paid
@@ -805,6 +846,19 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
     received = proceeds + ss_nominal
     shortfall = np.maximum(0.0, nominal_target - received) + remaining_tax
     s.real_shortfall[:, year_idx] = shortfall / s.cumulative_inflation
+
+    # 9b) HELOC backstop for spending shortfalls. Drawn AFTER all account
+    # waterfalls have been exhausted; reduces the recorded shortfall by the
+    # amount actually drawn. Subsequent years carry the HELOC balance and
+    # accrue interest in the rental block. Without this draw the ruin check
+    # below was a phantom backstop — it credited accessible_equity toward
+    # avoiding ruin without ever putting the cash on the household's table.
+    if scn.rental_property is not None and s.rental_owned.any():
+        short_real = s.real_shortfall[:, year_idx]
+        if (short_real > 0).any():
+            drawn_real = _rental.draw_heloc_real(
+                s, short_real, scn.rental_property)
+            s.real_shortfall[:, year_idx] -= drawn_real
 
     # 10) Rebalance tax-advantaged
     _rebalance_to_target(s.trad_balance, tgt_trad)

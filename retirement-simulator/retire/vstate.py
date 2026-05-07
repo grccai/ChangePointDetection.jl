@@ -82,6 +82,19 @@ class VState:
     real_equity_by_year: np.ndarray = field(  # (P, H + 1)
         default_factory=lambda: np.zeros((0, 0)))
 
+    # Baseline tax inputs for the year currently being simulated. Populated
+    # by `_step_accumulation` / `_step_decumulation` after their tax bill is
+    # computed; consumed by the rental block to compute the *incremental*
+    # federal tax of stacking rental ordinary income on top of the year's
+    # baseline (instead of taxing rental at a zero baseline, which
+    # systematically understates marginal rate).
+    year_ord_income_n: np.ndarray = field(   # (P,) nominal $
+        default_factory=lambda: np.zeros(0))
+    year_ltcg_income_n: np.ndarray = field(  # (P,)
+        default_factory=lambda: np.zeros(0))
+    year_ss_nominal: np.ndarray = field(     # (P,)
+        default_factory=lambda: np.zeros(0))
+
     # Rental property (optional). All paths share the same scalar config in
     # the Scenario; per-path arrays track owned-state + value + debt. When
     # no rental is configured these are zero-length placeholders.
@@ -122,6 +135,9 @@ class VState:
             real_balance_by_year=np.zeros((n_paths, horizon + 1, 3, 3)),
             real_contrib_by_year=np.zeros((n_paths, horizon, 3, 3)),
             real_equity_by_year=np.zeros((n_paths, horizon + 1)),
+            year_ord_income_n=zeros1.copy(),
+            year_ltcg_income_n=zeros1.copy(),
+            year_ss_nominal=zeros1.copy(),
             rental_owned=np.zeros(n_paths, dtype=bool),
             rental_value_real=np.zeros(n_paths),
             mortgage_balance_nominal=np.zeros(n_paths),
