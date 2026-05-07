@@ -36,7 +36,8 @@ import numpy as np
 from scipy.optimize import differential_evolution, minimize
 
 from .config import (Scenario, Allocation, TargetAllocations,
-                     WithdrawalPolicy)
+                     WithdrawalPolicy, RentalProperty,
+                     RentalPurchaseTrigger)
 from .location import heuristic_target_allocations
 from .policy import (Policy, StaticPolicy, GlidePolicy,
                      build_glide_policy, GLIDE_PARAM_BOUNDS,
@@ -105,6 +106,11 @@ class OptimizerConfig:
     # evaluate worst-case across. Default = ['gbm', 'historical'] when
     # objective='fire_prob_robust'. Doubles per-eval MC cost.
     robust_return_modes: list[str] | None = None
+    # If True and the scenario has a rental_property, append 5 extra
+    # decision variables to the search vector covering the rental's
+    # purchase trigger (min_age, min_liquid, min_taxable), purchase price,
+    # and source state. See RENTAL_PARAM_BOUNDS / decode_rental.
+    optimize_rental: bool = False
 
 
 def _alloc(s: float, b: float) -> Allocation:
@@ -120,6 +126,81 @@ def _snap_conversion(raw: float) -> float | None:
     idx = int(round(raw))
     idx = max(0, min(len(candidates) - 1, idx))
     return candidates[idx]
+
+
+# ---------- Rental decision variables ----------
+# When OptimizerConfig.optimize_rental is True and the scenario has a
+# rental_property, the search vector is extended by 5 floats appended after
+# the policy-specific params:
+#
+#   r0  min_age              [40, 100]   purchase trigger age threshold;
+#                                         choosing >= horizon end-of-plan age
+#                                         effectively means "never buy".
+#   r1  min_liquid_real_M    [0.5, 5.0]  in $M; trigger liquid-wealth gate
+#   r2  min_taxable_real_M   [0.1, 2.0]  in $M; trigger taxable-wealth gate
+#   r3  price_real_M         [0.4, 2.0]  in $M; purchase price
+#   r4  state_idx            [0, 2.99]   snaps to {TX, OR, CA}, the
+#                                         no-tax / mid-tax / high-tax tiers
+#                                         relevant to rental income sourcing.
+#
+# Snap rules: r4 floor()s to int and indexes _RENTAL_STATES.
+RENTAL_PARAM_BOUNDS: list[tuple[float, float]] = [
+    (40.0, 100.0),    # min_age
+    (0.5, 5.0),       # min_liquid ($M)
+    (0.1, 2.0),       # min_taxable ($M)
+    (0.4, 2.0),       # price ($M)
+    (0.0, 2.999),     # state_idx -> {TX, OR, CA}
+]
+_RENTAL_STATES = ("TX", "OR", "CA")
+RENTAL_NPARAMS = len(RENTAL_PARAM_BOUNDS)
+
+
+def _snap_rental_state(idx_raw: float) -> str:
+    idx = int(np.floor(max(0.0, min(len(_RENTAL_STATES) - 1e-9, idx_raw))))
+    return _RENTAL_STATES[idx]
+
+
+def decode_rental(x_tail: np.ndarray | list[float],
+                  rp_base: RentalProperty) -> RentalProperty:
+    """Build a RentalProperty by overriding `rp_base` with the 5 trailing
+    decision vars."""
+    if len(x_tail) != RENTAL_NPARAMS:
+        raise ValueError(
+            f"expected {RENTAL_NPARAMS} rental params, got {len(x_tail)}")
+    min_age = float(np.clip(x_tail[0], 40.0, 100.0))
+    min_liquid = float(np.clip(x_tail[1], 0.5, 5.0)) * 1_000_000
+    min_taxable = float(np.clip(x_tail[2], 0.1, 2.0)) * 1_000_000
+    price = float(np.clip(x_tail[3], 0.4, 2.0)) * 1_000_000
+    state = _snap_rental_state(x_tail[4])
+    return replace(
+        rp_base,
+        price_real=price,
+        location_state=state,
+        trigger=RentalPurchaseTrigger(
+            min_age=min_age,
+            min_liquid_real_wealth=min_liquid,
+            min_taxable_real_wealth=min_taxable,
+        ),
+    )
+
+
+def _split_x(x: np.ndarray, has_rental: bool
+             ) -> tuple[np.ndarray, np.ndarray | None]:
+    """Split a decision vector into (policy-params, rental-params or None)."""
+    if not has_rental:
+        return np.asarray(x), None
+    n = len(x)
+    return np.asarray(x[: n - RENTAL_NPARAMS]), np.asarray(x[n - RENTAL_NPARAMS:])
+
+
+def _apply_rental(scn: Scenario, x_rental: np.ndarray | None) -> None:
+    """In-place override of scn.rental_property when rental decision vars
+    are present. No-op otherwise."""
+    if x_rental is None:
+        return
+    if scn.rental_property is None:
+        return
+    scn.rental_property = decode_rental(x_rental, scn.rental_property)
 
 
 def _decode_free(x: np.ndarray) -> tuple[TargetAllocations, float | None, float]:
@@ -208,10 +289,13 @@ class _Objective:
     cfg: OptimizerConfig
     horizon: int
     years_to_retire: int
+    has_rental: bool = False
 
     def __call__(self, x: np.ndarray) -> float:
-        policy = _build_policy(x, self.scn_base, self.cfg)
+        x_pol, x_rent = _split_x(x, self.has_rental)
+        policy = _build_policy(x_pol, self.scn_base, self.cfg)
         scn = deepcopy(self.scn_base)
+        _apply_rental(scn, x_rent)
         scn.simulation.n_paths = self.cfg.n_paths_inner
         scn.simulation.seed = self.cfg.seed
         result = simulate(scn, policy=policy)
@@ -245,10 +329,13 @@ class _FIREProbObjective:
     fire_target_real: float
     ruin_max: float
     year_idx_at_fire: int   # precomputed
+    has_rental: bool = False
 
     def __call__(self, x: np.ndarray) -> float:
-        policy = _build_policy(x, self.scn_base, self.cfg)
+        x_pol, x_rent = _split_x(x, self.has_rental)
+        policy = _build_policy(x_pol, self.scn_base, self.cfg)
         scn = deepcopy(self.scn_base)
+        _apply_rental(scn, x_rent)
         scn.simulation.n_paths = self.cfg.n_paths_inner
         scn.simulation.seed = self.cfg.seed
         result = simulate(scn, policy=policy)
@@ -291,10 +378,13 @@ class _FIREProbWeightedObjective:
     ruin_max: float
     year_indices: list[int]   # year_idx for ages fire_age..fire_age+10
     weights: np.ndarray       # length 11, (1 - i/10) for i=0..10
+    has_rental: bool = False
 
     def __call__(self, x: np.ndarray) -> float:
-        policy = _build_policy(x, self.scn_base, self.cfg)
+        x_pol, x_rent = _split_x(x, self.has_rental)
+        policy = _build_policy(x_pol, self.scn_base, self.cfg)
         scn = deepcopy(self.scn_base)
+        _apply_rental(scn, x_rent)
         scn.simulation.n_paths = self.cfg.n_paths_inner
         scn.simulation.seed = self.cfg.seed
         result = simulate(scn, policy=policy)
@@ -338,13 +428,16 @@ class _FIREProbRobustObjective:
     year_indices: list[int]
     weights: np.ndarray
     return_modes: list[str]      # e.g., ["gbm", "historical"]
+    has_rental: bool = False
 
     def __call__(self, x: np.ndarray) -> float:
-        policy = _build_policy(x, self.scn_base, self.cfg)
+        x_pol, x_rent = _split_x(x, self.has_rental)
+        policy = _build_policy(x_pol, self.scn_base, self.cfg)
         rewards = []
         ruins = []
         for mode in self.return_modes:
             scn = deepcopy(self.scn_base)
+            _apply_rental(scn, x_rent)
             scn.simulation.n_paths = self.cfg.n_paths_inner
             scn.simulation.seed = self.cfg.seed
             scn.simulation.return_model = mode
@@ -368,6 +461,7 @@ class _FIREProbRobustObjective:
 
 
 def _objective_for(scn_base: Scenario, cfg: OptimizerConfig):
+    has_rental = bool(cfg.optimize_rental and scn_base.rental_property is not None)
     fire_objs = ("fire_prob", "fire_prob_weighted", "fire_prob_robust")
     if cfg.objective in fire_objs:
         fire_age = cfg.fire_age if cfg.fire_age is not None \
@@ -384,6 +478,7 @@ def _objective_for(scn_base: Scenario, cfg: OptimizerConfig):
                 fire_age=fire_age, fire_target_real=fire_target,
                 ruin_max=cfg.ruin_max,
                 year_idx_at_fire=year_idx_at_fire,
+                has_rental=has_rental,
             )
         year_indices = [
             min(horizon, max(0, int(round(fire_age + i - start_age))))
@@ -396,6 +491,7 @@ def _objective_for(scn_base: Scenario, cfg: OptimizerConfig):
                 fire_age=fire_age, fire_target_real=fire_target,
                 ruin_max=cfg.ruin_max,
                 year_indices=year_indices, weights=weights,
+                has_rental=has_rental,
             )
         # fire_prob_robust
         modes = cfg.robust_return_modes or ["gbm", "historical"]
@@ -405,11 +501,13 @@ def _objective_for(scn_base: Scenario, cfg: OptimizerConfig):
             ruin_max=cfg.ruin_max,
             year_indices=year_indices, weights=weights,
             return_modes=list(modes),
+            has_rental=has_rental,
         )
     return _Objective(
         scn_base=scn_base, cfg=cfg,
         horizon=scn_base.profile.horizon(),
         years_to_retire=scn_base.profile.years_to_retirement(),
+        has_rental=has_rental,
     )
 
 
@@ -533,8 +631,14 @@ def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
             (0.0, 5.0),              # conversion bracket index
             (0.0, 1.0),              # trad split fraction
         ]
+    has_rental = bool(cfg.optimize_rental and scn.rental_property is not None)
+    if has_rental:
+        bounds = bounds + list(RENTAL_PARAM_BOUNDS)
     res = _run_search(obj, bounds, cfg)
-    policy = _build_policy(res.x, scn, cfg)
+    x_pol, x_rent = _split_x(res.x, has_rental)
+    policy = _build_policy(x_pol, scn, cfg)
+    rental_decoded = decode_rental(x_rent, scn.rental_property) \
+        if has_rental and scn.rental_property is not None else None
     if cfg.policy_class in ("glide", "three_knot_glide", "bond_tent", "cppi",
                              "bodie_merton", "multi_phase", "vol_targeting"):
         # For glide policies, "current-year" allocations come from
@@ -552,12 +656,18 @@ def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
         conv_target = d0.conversion_bracket
         trad_split = d0.trad_contribution_split
     elif cfg.location_mode == "heuristic":
-        allocations, conv_target, trad_split = _decode_heuristic(res.x, scn)
+        allocations, conv_target, trad_split = _decode_heuristic(x_pol, scn)
     else:
-        allocations, conv_target, trad_split = _decode_free(res.x)
+        allocations, conv_target, trad_split = _decode_free(x_pol)
+    if rental_decoded is not None:
+        # Mutate the caller's scenario so subsequent simulate() calls
+        # (CLI final-evaluation, per-mode re-eval) use the optimized
+        # rental decision.
+        scn.rental_property = rental_decoded
     diag = {"obj_value": float(res.fun), "nit": int(res.nit), "nfev": int(res.nfev),
             "x": res.x.tolist(), "message": str(res.message),
             "location_mode": cfg.location_mode,
+            "rental": rental_decoded,
             "policy_class": cfg.policy_class,
             "algorithm": cfg.algorithm,
             "policy": policy}

@@ -120,6 +120,14 @@ def optimize_cmd(
              "'gbm', 'historical', 'historical_ath', "
              "'historical_stretched_ath', 'deterministic'.",
     ),
+    optimize_rental: bool = typer.Option(
+        False,
+        "--optimize-rental",
+        help="If the scenario has a rental_property block, also optimize the "
+             "rental decision: purchase trigger (min_age, min_liquid, "
+             "min_taxable), purchase price, and source state (snapped to "
+             "TX/OR/CA). Adds 5 dimensions to the search.",
+    ),
 ) -> None:
     """Optimize allocation and contribution split for the scenario."""
     scn = load_scenario(config)
@@ -134,7 +142,8 @@ def optimize_cmd(
                                           else None,
                          ruin_max=ruin_max,
                          robust_return_modes=robust_mode_list,
-                         algorithm=algorithm, max_evals=max_evals)
+                         algorithm=algorithm, max_evals=max_evals,
+                         optimize_rental=optimize_rental)
     print("Running differential evolution... (this can take a few minutes)")
     allocations, conv_bracket, trad_split, diag = optimize(scn, cfg)
     print(f"\n=== Optimal decisions (policy={diag['policy_class']}) ===")
@@ -199,6 +208,19 @@ def optimize_cmd(
         print(f"  taxable cash fraction:       {bm.taxable_cash:.2%}")
         print(f"  conv FIRE-gap:               {bm.conv_during_fire_gap}")
         print(f"  conv SS-window:              {bm.conv_during_ss_window}")
+    rp_opt = diag.get("rental")
+    if rp_opt is not None:
+        end_age = scn.profile._age_on(scn.profile.end_of_plan_date)
+        print()
+        print(f"Rental property decision (optimized):")
+        print(f"  price_real:                  ${rp_opt.price_real:>12,.0f}")
+        print(f"  location_state:              {rp_opt.location_state}")
+        tr = rp_opt.trigger
+        never = tr.min_age >= end_age
+        print(f"  trigger.min_age:             {tr.min_age:.1f}"
+              f"{'  (>= horizon end ⇒ NEVER BUY)' if never else ''}")
+        print(f"  trigger.min_liquid_real:     ${tr.min_liquid_real_wealth:>12,.0f}")
+        print(f"  trigger.min_taxable_real:    ${tr.min_taxable_real_wealth:>12,.0f}")
     print(f"\nOptimizer diagnostics: nfev={diag['nfev']}, nit={diag['nit']}, "
           f"obj={diag['obj_value']:.3f}")
 
