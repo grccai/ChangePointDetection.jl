@@ -27,8 +27,16 @@ FIG_SUBDIR = os.environ.get("FIG_SUBDIR", SCENARIO_ID)
 FIG_DIR = Path(__file__).resolve().parent / FIG_SUBDIR
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-STRATEGIES = ["static_baseline", "bond_tent_robust",
-              "bond_tent_stretched", "bodie_merton"]
+if SCENARIO_ID.endswith("_v4"):
+    STRATEGIES = ["static_baseline", "bond_tent_v4_gbm",
+                  "bodie_merton_v4_gbm", "bond_tent_v4_robust"]
+    # bodie_merton_v4_robust is appended at runtime once that optimizer
+    # run lands — see run_snapshots.py STRATEGIES_V4_RENTAL.
+    if (SNAP_DIR / "bodie_merton_v4_robust__gbm.npz").exists():
+        STRATEGIES.append("bodie_merton_v4_robust")
+else:
+    STRATEGIES = ["static_baseline", "bond_tent_robust",
+                  "bond_tent_stretched", "bodie_merton"]
 RETURN_MODES = ["gbm", "historical", "historical_ath", "historical_stretched_ath"]
 MODE_LABELS = {
     "gbm": "GBM (lognormal)",
@@ -41,6 +49,10 @@ STRAT_LABELS = {
     "bond_tent_robust": "BondTent [gbm,hist_ath]",
     "bond_tent_stretched": "BondTent [gbm,stretched_ath]",
     "bodie_merton": "Bodie-Merton HC",
+    "bond_tent_v4_gbm": "BondTent v4 GBM",
+    "bond_tent_v4_robust": "BondTent v4 robust",
+    "bodie_merton_v4_gbm": "Bodie-Merton v4 GBM",
+    "bodie_merton_v4_robust": "Bodie-Merton v4 robust",
 }
 
 FIRE_TARGET = float(os.environ.get("FIRE_TARGET", "2500000"))
@@ -148,7 +160,11 @@ def fire_ruin_grid():
     colors = {"static_baseline": "#888888",
               "bond_tent_robust": "#1f77b4",
               "bond_tent_stretched": "#9467bd",
-              "bodie_merton": "#2ca02c"}
+              "bodie_merton": "#2ca02c",
+              "bond_tent_v4_gbm": "#1f77b4",
+              "bond_tent_v4_robust": "#0d3d6e",
+              "bodie_merton_v4_gbm": "#2ca02c",
+              "bodie_merton_v4_robust": "#155f1d"}
     for c, mode in enumerate(RETURN_MODES):
         ax_fire = axes[0, c]
         ax_ruin = axes[1, c]

@@ -23,10 +23,34 @@ from retire.simulate import simulate
 from retire.policy import (
     StaticPolicy, build_bond_tent_policy, build_bodie_merton_policy,
 )
-from retire.config import Allocation, TargetAllocations
+from retire.config import (Allocation, TargetAllocations, RentalProperty,
+                            RentalPurchaseTrigger)
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _override_rental(scn, *, price_real: float, location_state: str,
+                      min_age: float, min_liquid: float,
+                      min_taxable: float):
+    """Replace scn.rental_property with v4-optimized fields. Keeps the
+    other RentalProperty fields (cap_rate, expense_ratio, mortgage rate,
+    etc.) as configured in the YAML so we only override the decision
+    variables."""
+    if scn.rental_property is None:
+        return  # no rental in scenario; no-op
+    rp = scn.rental_property
+    from dataclasses import replace
+    scn.rental_property = replace(
+        rp,
+        price_real=price_real,
+        location_state=location_state,
+        trigger=RentalPurchaseTrigger(
+            min_age=min_age,
+            min_liquid_real_wealth=min_liquid,
+            min_taxable_real_wealth=min_taxable,
+        ),
+    )
 
 
 def static_policy_from_yaml(scn) -> StaticPolicy:
@@ -86,6 +110,72 @@ STRATEGIES = {
     "bodie_merton": bodie_merton_default,
 }
 
+# v4 optimized strategies for the trial_rental scenario. Each value is a
+# (policy_builder, rental_override_dict) tuple. Selected when
+# SCENARIO_ID="trial_rental_v4".
+def _bt_v4_gbm(scn):
+    """v4 bond_tent + rental on GBM, fire_prob_weighted optimum."""
+    retirement_age = scn.profile.retirement_age
+    tent_offset = 68.8 - retirement_age
+    # bond_tent layout: stock_high, stock_low, tent_age_offset, span,
+    #                   taxable_cash, conv_fire_idx, conv_ss_idx, trad_split,
+    #                   wealth_resp. Conv indices: 0=None, 1=10%, 2=12%,
+    #                   3=22%, 4=24%, 5=32%.
+    x = [0.8085, 0.1667, tent_offset, 29.2, 0.40, 0.0, 2.0, 0.819, 0.215]
+    return build_bond_tent_policy(x, retirement_age=retirement_age)
+
+
+def _bt_v4_robust(scn):
+    """v4 bond_tent + rental robust [gbm,hist] optimum."""
+    retirement_age = scn.profile.retirement_age
+    tent_offset = 58.3 - retirement_age
+    x = [0.8078, 0.5391, tent_offset, 7.8, 0.2353, 4.0, 4.0, 0.934, 0.209]
+    return build_bond_tent_policy(x, retirement_age=retirement_age)
+
+
+def _bm_v4_gbm(scn):
+    """v4 bodie_merton + rental GBM optimum (reward 4.555).
+
+    Layout: gamma, r_hc, taxable_cash, conv_fire_idx, conv_ss_idx,
+    trad_split. The optimum's Merton target was 39.10% of total wealth;
+    back-solving (mu-rf)/(gamma*sigma^2) at the trial market (mu=6%,
+    rf=0.5%, sigma=18%) gives gamma=4.34. r_hc=3% real (default; the
+    optimizer's choice on r_hc isn't printed but it only affects HC
+    trajectory shape, not the Merton constant)."""
+    retirement_age = scn.profile.retirement_age
+    x = [4.34, 0.03, 0.168, 3.0, 5.0, 0.951]
+    return build_bodie_merton_policy(x, scn, retirement_age=retirement_age)
+
+
+def _bm_v4_robust(scn):
+    """v4 bodie_merton + rental robust [gbm,hist] optimum.
+    Parameters set once /tmp/opt_v4_bm_robust.log lands; placeholder
+    uses bm_v4_gbm so the snapshot script doesn't error if invoked
+    early."""
+    return _bm_v4_gbm(scn)
+
+
+STRATEGIES_V4_RENTAL = {
+    "static_baseline": (static_policy_from_yaml, None),
+    "bond_tent_v4_gbm": (
+        _bt_v4_gbm,
+        dict(price_real=1_276_517, location_state="TX",
+             min_age=40.2, min_liquid=559_512, min_taxable=177_226),
+    ),
+    "bodie_merton_v4_gbm": (
+        _bm_v4_gbm,
+        dict(price_real=1_483_607, location_state="CA",
+             min_age=40.8, min_liquid=772_992, min_taxable=209_262),
+    ),
+    "bond_tent_v4_robust": (
+        _bt_v4_robust,
+        dict(price_real=850_270, location_state="TX",
+             min_age=44.9, min_liquid=807_710, min_taxable=401_488),
+    ),
+    # bodie_merton_v4_robust is added below once that optimizer run lands;
+    # see _bm_v4_robust for the (currently placeholder) parameters.
+}
+
 RETURN_MODES = ["gbm", "historical", "historical_ath", "historical_stretched_ath"]
 
 
@@ -137,15 +227,24 @@ def main():
         else os.path.join(REPO_ROOT, scenario_yaml)
     snap_dir = os.path.join(REPO_ROOT, "snapshots", scenario_id)
     os.makedirs(snap_dir, exist_ok=True)
-    print(f"Running snapshots: {len(STRATEGIES)} strategies x "
+    # SCENARIO_ID="trial_rental_v4" -> use the v4 rental-aware strategy set
+    # (each strategy ships both a policy and a rental override dict).
+    use_v4 = scenario_id.endswith("_v4")
+    strategies = STRATEGIES_V4_RENTAL if use_v4 else \
+                  {k: (v, None) for k, v in STRATEGIES.items()}
+    print(f"Running snapshots: {len(strategies)} strategies x "
           f"{len(RETURN_MODES)} return modes, n_paths={n_paths}")
     print(f"  scenario_id={scenario_id}  yaml={cfg_path}")
     print(f"  snap_dir={snap_dir}")
-    for strat_name, build in STRATEGIES.items():
+    for strat_name, (build, rental_override) in strategies.items():
         scn = load_scenario(cfg_path)
+        if rental_override is not None:
+            _override_rental(scn, **rental_override)
         policy = build(scn)
         for mode in RETURN_MODES:
             scn_m = load_scenario(cfg_path)
+            if rental_override is not None:
+                _override_rental(scn_m, **rental_override)
             run_one(strat_name, policy, scn_m, mode, n_paths, seed, snap_dir)
     print("Done.")
 
