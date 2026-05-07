@@ -105,16 +105,29 @@ def _niit_vec(magi: np.ndarray, nii: np.ndarray, fs: FilingStatus,
 
 def _federal_tax_vec(ord_income: np.ndarray, ltcg_income: np.ndarray,
                      ss_benefit: np.ndarray, fs: FilingStatus,
-                     ty: TaxYear = TAX_2024
+                     ty: TaxYear = TAX_2024,
+                     nii_extra: np.ndarray | None = None,
                      ) -> Tuple[np.ndarray, np.ndarray]:
-    """Returns (federal_total, ord_taxable_after_std_ded)."""
+    """Returns (federal_total, ord_taxable_after_std_ded).
+
+    `nii_extra` (optional, P,) is additional Net Investment Income beyond
+    LTCG that should attract NIIT — typically interest, ordinary dividends,
+    short-term gains realised this year, and passive rental net income. It
+    is added to LTCG to form NII for the NIIT calc, but it is NOT folded
+    into ordinary or LTCG taxable income (it's already in `ord_income` /
+    elsewhere). Defaults to zero (legacy behaviour: NIIT only on LTCG).
+    """
     ss_tax = _ss_taxable_vec(ss_benefit, ord_income + ltcg_income, fs, ty)
     sd = ty.std_deduction[fs]
     ord_taxable = np.maximum(0.0, ord_income + ss_tax - sd)
     fed_ord = _progressive_tax_vec(ord_taxable, ty.ordinary_brackets[fs])
     fed_ltcg = _ltcg_tax_vec(ord_taxable, ltcg_income, ty.ltcg_brackets[fs])
     magi = ord_income + ss_tax + ltcg_income
-    niit = _niit_vec(magi, ltcg_income, fs, ty)
+    if nii_extra is None:
+        nii = ltcg_income
+    else:
+        nii = ltcg_income + np.maximum(0.0, nii_extra)
+    niit = _niit_vec(magi, nii, fs, ty)
     return fed_ord + fed_ltcg + niit, ord_taxable
 
 
@@ -453,9 +466,15 @@ def simulate(scn: Scenario,
             ord_baseline_n = s.year_ord_income_n
             ltcg_baseline_n = s.year_ltcg_income_n
             ss_baseline_n = s.year_ss_nominal
+            # Rental net income IS net investment income for NIIT purposes
+            # (passive rental real estate; we don't model the real-estate-
+            # professional exception). Stack as NII alongside the year's
+            # baseline NII (= ltcg + ord-div interest portion).
+            rental_nii = np.maximum(0.0, rental_taxable_n)
             fed_with_rental, _ = _federal_tax_vec(
                 np.maximum(0.0, ord_baseline_n + rental_taxable_n),
-                ltcg_baseline_n, ss_baseline_n, fs)
+                ltcg_baseline_n, ss_baseline_n, fs,
+                nii_extra=rental_nii)
             fed_baseline_recomp, _ = _federal_tax_vec(
                 ord_baseline_n, ltcg_baseline_n, ss_baseline_n, fs)
             fed_rent_tax = fed_with_rental - fed_baseline_recomp
@@ -647,11 +666,14 @@ def _step_accumulation(s: VState, scn: Scenario, age: float, year_idx: int,
 
     # 4) Tax bill
     # Federal: ordinary base = wages_after_pretax + ord_div; LTCG = qual_div.
+    # NII for NIIT = LTCG + interest (ord_div from bond/cash yields). Wages
+    # and pre-tax 401k dollars are not NII.
     wages_after_pretax = max(0.0, total_wages - pretax_trad)
     ord_income_fed = wages_after_pretax + ord_div
     ltcg_income = qual_div
     fed_tax, _ = _federal_tax_vec(ord_income_fed, ltcg_income,
-                                  np.zeros(P), fs)
+                                  np.zeros(P), fs,
+                                  nii_extra=ord_div)
     # State tax: wages by employment state (apportioning pretax_401k);
     # plus residency tax on dividends.
     state_wage_tax_scalar = state_wages_tax(
@@ -713,6 +735,11 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
     """Vectorised decumulation year, in-place mutation of s."""
     P = s.n_paths
     sim_start = scn.profile.start_date
+    # Snapshot prior-year-end Trad balance for the RMD divisor (IRS uses
+    # Dec-31-of-prior-year FMV — do this BEFORE the year's returns are
+    # applied below, otherwise the RMD is overstated by (1 + r_trad)).
+    prior_trad_n_for_rmd = s.trad_balance.sum(-1).copy()
+
     # 1) Returns
     s.trad_balance *= (1.0 + returns_y)
     s.roth_balance *= (1.0 + returns_y)
@@ -725,6 +752,17 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
     s.tax_st_basis += yield_amt
     qual_div = yield_amt[:, 0]
     ord_div = yield_amt[:, 1] + yield_amt[:, 2]
+
+    # 1b) Fold deferred tax items from last year's tax-payment withdrawals
+    # into this year's tax base. The carry-forward model: gains realised by
+    # selling lots / pulling Trad / pulling Roth to fund year y's tax bill
+    # land on year y+1's return.
+    deferred_lt_n = s.deferred_lt_gain_n.copy()
+    deferred_st_n = s.deferred_st_gain_n.copy()
+    deferred_ord_n = s.deferred_ord_n.copy()
+    s.deferred_lt_gain_n[:] = 0.0
+    s.deferred_st_gain_n[:] = 0.0
+    s.deferred_ord_n[:] = 0.0
 
     # 2) Spending target (real, then nominal). Per-path because flexible
     # spending makes the target depend on each path's portfolio drawdown.
@@ -766,21 +804,33 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
         ss_nominal = (scn.social_security.monthly_at_67 * 12.0
                       * s.cumulative_inflation)
 
-    # 4) RMDs (forced traditional withdrawal)
+    # 4) RMDs (forced traditional withdrawal). Divisor applies to the
+    # prior-year-end balance (snapshot taken above before the year's
+    # returns).
     rmd_amt = np.zeros(P)
     age_int = int(age + 1e-6)  # robust to float wobble on birthday boundary
     if age_int >= RMD_START_AGE:
-        prior_trad = s.trad_balance.sum(-1)
         divisor = RMD_DIVISORS.get(min(age_int, max(RMD_DIVISORS)), 6.0)
-        rmd_amt = prior_trad / divisor
+        rmd_amt = prior_trad_n_for_rmd / divisor
     rmd_taken = withdraw_traditional(s, rmd_amt)
 
-    ord_income = ord_div + rmd_taken
-    ltcg_income = qual_div
+    ord_income = ord_div + rmd_taken + deferred_ord_n + deferred_st_n
+    ltcg_income = qual_div + deferred_lt_n
 
-    # 5) Roth conversion ladder. Bracket target comes from the policy
+    # 5) Spending withdrawal — moved BEFORE the conversion sizing so the
+    # conversion can fill the bracket precisely without overshooting from
+    # spending-withdrawal-realized ST gains.
+    net_need = np.maximum(0.0, nominal_target - ss_nominal)
+    proceeds, lt_g, st_g = _execute_withdrawal_strategy(
+        s, net_need, age, year_idx, scn)
+    ltcg_income += lt_g
+    ord_income += st_g
+
+    # 6) Roth conversion ladder. Bracket target comes from the policy
     # (which may be life-phase conditional), with the ACA cap from
-    # withdrawal config.
+    # withdrawal config. Sized using the *current* ord_income, which
+    # already includes RMDs, deferred carry-forward, and ST gains from the
+    # spending withdrawal — so the conversion fills the bracket exactly.
     wd = scn.withdrawal
     conv_bracket = decision.conversion_bracket
     if conv_bracket is not None:
@@ -799,15 +849,14 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
         s.roth_conversions[:, year_idx] += actual_conv
         ord_income += actual_conv
 
-    # 6) Spending withdrawal
-    net_need = np.maximum(0.0, nominal_target - ss_nominal)
-    proceeds, lt_g, st_g = _execute_withdrawal_strategy(
-        s, net_need, age, year_idx, scn)
-    ltcg_income += lt_g
-    ord_income += st_g
-
-    # 7) Tax bill (federal + state)
-    fed_tax, _ = _federal_tax_vec(ord_income, ltcg_income, ss_nominal, fs)
+    # 7) Tax bill (federal + state). NII for NIIT = LTCG + (interest from
+    # bond/cash yields) + (ST cap gains realised this year) + (deferred LT
+    # already in ltcg, deferred ST already in ord_income/nii_extra). RMDs,
+    # Trad withdrawals, conversions, and wages are NOT NII (excluded by
+    # IRS).
+    nii_extra = ord_div + st_g + deferred_st_n
+    fed_tax, _ = _federal_tax_vec(ord_income, ltcg_income, ss_nominal, fs,
+                                   nii_extra=nii_extra)
     # In retirement: any wages from active income sources still apply
     # (e.g., post-retirement consulting). Otherwise pure residency-based tax.
     wages_by_state = timeline.wages_by_state(sim_start, year_idx)
@@ -830,17 +879,33 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
     s.year_ltcg_income_n[:] = ltcg_income
     s.year_ss_nominal[:] = ss_nominal
 
-    # 8) Pay tax: another withdrawal pass for the tax dollars
+    # 8) Pay tax: another withdrawal pass for the tax dollars. Realised
+    # gains / ordinary income from this pass are deferred to next year's
+    # return (carry-forward model: stock sold to settle this year's tax
+    # bill is settled in early year+1 and shows up on year+1's 1099-B).
     paid, lt_g2, st_g2 = withdraw_taxable_for_spending(s, bill_total)
     remaining_tax = bill_total - paid
+    pulled_trad = np.zeros(P)
+    r_ord = np.zeros(P)
+    r_pen = np.zeros(P)
     if (remaining_tax > 0).any():
         # Try traditional (post-59.5 only — pre-59.5 hits penalty)
         if age >= 59.5:
-            pulled = withdraw_traditional(s, remaining_tax)
-            remaining_tax -= pulled
+            pulled_trad = withdraw_traditional(s, remaining_tax)
+            remaining_tax -= pulled_trad
         if (remaining_tax > 0).any():
-            r_proc, r_ord, r_pen = withdraw_roth(s, remaining_tax, year_idx, age)
+            r_proc, r_ord_pulled, r_pen_pulled = withdraw_roth(
+                s, remaining_tax, year_idx, age)
             remaining_tax -= r_proc
+            r_ord = r_ord_pulled
+            r_pen = r_pen_pulled
+
+    # Carry forward all the gains/income created by paying this year's tax.
+    # Trad pulls are fully ordinary; Roth pulls return ord (earnings) +
+    # penalty (10%) which we treat as ordinary on next year's return.
+    s.deferred_lt_gain_n[:] = lt_g2
+    s.deferred_st_gain_n[:] = st_g2
+    s.deferred_ord_n[:] = pulled_trad + r_ord + r_pen
 
     # 9) Compute shortfall
     received = proceeds + ss_nominal
