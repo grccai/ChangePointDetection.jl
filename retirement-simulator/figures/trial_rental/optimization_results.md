@@ -97,3 +97,83 @@ return models, ruin ≤ 1.6% in both modes.
   parameters (9 for bond_tent, 6 for bodie_merton).
 * Runtime: bodie_merton ~10–15 min on 4 cores; bond_tent ~25–35 min;
   robust bond_tent ~30–40 min (doubles per-eval cost across modes).
+
+## v3 (post tax-accounting fixes)
+
+A second audit found four more issues (commit `f81583a`):
+* **P0** — Tax-payment withdrawals at end of `_step_decumulation` were
+  realising gains/income that never made it onto any tax return.
+  Carry-forward fix: stash the tax-payment-withdrawal lt_g/st_g/trad/
+  Roth-ord on `s.deferred_*_n` and fold into next year's tax base.
+  Magnitude: median lifetime tax up ~7.8% on `trial.yaml`.
+* **P1-RMD** — Divisor was being applied to the post-return Trad
+  balance; should use prior-year-end. Fixed by snapshotting before
+  returns are applied.
+* **P1-NIIT** — NIIT was only computed on LTCG; should be on full NII
+  (LTCG + interest + ST cap gains + passive rental). `nii_extra` arg
+  added to `_federal_tax_vec`.
+* **P2** — Roth conversion ladder sized before the spending withdrawal
+  generated ST gains, so could overshoot the targeted bracket.
+  Reordered: spending withdrawal first, then conversion fills exactly.
+
+### v2 → v3 results
+
+| Run | Reward (v2 → v3) | P(ruin) (v2 → v3) | Median terminal (v2 → v3) |
+|---|---|---|---|
+| bond_tent + rental, GBM | 4.545 → **4.532** | 0.66% → 0.56% | $3.91M → **$4.47M** |
+| bodie_merton + rental, GBM | 4.598 → **4.541** | 0.30% → 0.88% | $4.07M → $4.37M |
+| bond_tent + rental, robust | 4.490 → **4.495** | 0.54%/1.58% → 0.28%/1.00% | $4.91M → $4.39M |
+
+Under the corrected tax model, lifetime tax is materially higher
+(~$2.5M → ~$2.7-2.9M median per path) and the optimizer compensates
+in different ways across the three runs:
+
+### v3 rental decisions
+
+| Parameter | bt GBM | bm GBM | bt robust |
+|---|---|---|---|
+| price_real | $1.17M | $1.27M | **$0.63M** |
+| location_state | TX | **CA** | **CA** |
+| trigger.min_age | 40.2 | 40.3 | 41.0 |
+| trigger.min_liquid | $647k | $638k | $515k |
+| trigger.min_taxable | $291k | $106k | $160k |
+
+The "buy early" verdict from v2 holds in all three v3 runs — that
+finding is robust to the tax fixes. State and price drift more (likely
+the optimizer trading off NIIT-on-rental vs no-state-tax vs leverage
+size), so don't read too much into TX-vs-CA differences here without
+larger budget runs.
+
+### v3 allocation shapes
+
+The allocation policy moves substantially in response to the higher
+modelled tax burden:
+
+* **bond_tent v3 GBM**: stock_high **66%** (was 85%), stock_low **1.4%**
+  at age 62, span 8y, **35% taxable cash sleeve** (was 12%), wealth_resp
+  0.27. Very conservative: low equity throughout + huge cash buffer +
+  deep V at retirement to ride out sequence-of-returns risk on the
+  larger tax bills.
+* **bodie_merton v3 GBM**: Merton 32% as before, but **29% taxable cash**
+  (was 13%) and **22% FIRE-gap conversions** (was 10%). Aggressive
+  conversion ladder during the FIRE-gap to flatten the ord-income
+  trajectory before SS / RMDs hit.
+* **bond_tent v3 robust**: degenerate to **flat 76% stock** (no V at
+  all — stock_high = stock_low). Tiny taxable cash (1.8%). Smaller
+  rental ($631k) bought early in CA. The robust objective discounts
+  big tactical moves under historical-mode tail risk; flat-and-modest
+  wins.
+
+### Recommended baseline (v3)
+
+Three different policy shapes get nearly identical rewards (4.49–4.54)
+in v3, which suggests the optimum is broad: many policies do well as
+long as they (a) buy a rental early to capture leverage, (b) hold a
+healthy cash buffer for the higher tax bills, and (c) run aggressive
+Roth conversions during the FIRE-gap.
+
+For a single recommendation: **bond_tent v3 GBM** has the best balance
+(reward 4.532, ruin 0.56%, median terminal $4.47M). For risk-averse
+users worried about historical-mode regimes, **bond_tent v3 robust**
+has the lowest ruin (0.28% / 1.00%) but slightly lower upside.
+
