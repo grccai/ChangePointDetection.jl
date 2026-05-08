@@ -99,14 +99,80 @@ narrative:
 > true ruin tolerance is much tighter than 2%, but not what the
 > objective asked for.
 
-## Q3 — Optimizer-seed stability (in progress)
+## Q3 — Optimizer-seed stability
 
-Re-running the v5 bodie_merton-robust optimization with 4 fresh DE
-seeds. Goal: see whether the late-buy basin is seed-stable, or whether
-some seeds find the early-buy basin (which we now know is genuinely
-better at the realistic-cost evaluation).
+Re-ran the v5 `bodie_merton + rental + fire_prob_robust` optimization
+under five fresh DE seeds at the same budget (popsize=8, maxiter=15,
+n_paths_inner=1000). Then evaluated each seed-found rental decision
+under the v5 bm_robust **allocation policy** on 30 fresh MC seeds at
+4000 paths each (same allocation, only the rental override varies —
+isolating the rental-decision contribution to reward). Included v4's
+rental decision as a baseline.
 
-Results will be appended once the runs complete.
+| seed | inner-MC obj | rental | basin | 30-seed reward (mean ± SE) | 30-seed ruin |
+|---|---|---|---|---|---|
+| **v4 baseline** | (n/a)  | $858k CA, age 40.7, $769k liquid | early | **4.4449 ± 0.0056** | 0.729% |
+| 7              | -4.360 | $620k TX, age 40.2, $1.03M liquid | early | 4.4219 ± 0.0056 | 0.503% |
+| 101            | -4.397 | $708k TX, age 42.6, $755k liquid | early | 4.4184 ± 0.0055 | 0.609% |
+| 12345 (orig)   | -4.440 | $636k OR, age 78.6, $1.88M liquid | late | 4.3397 ± 0.0056 | 0.288% |
+| 31             | -4.332 | $1.03M OR, age 43.7, $4.82M liquid | hybrid (rare trigger) | 4.3387 ± 0.0056 | 0.301% |
+| 9999           | -4.279 | $1.08M CA, age 65.2, $4.99M liquid | retire-age | 4.3397 ± 0.0056 | 0.288% |
+
+Two clean basins:
+
+* **Buy-early** (seeds 7, 101, plus v4 baseline): reward ≈ 4.42-4.44,
+  ruin 0.5-0.7%. Property bought at age 40-43 with a moderate liquid
+  threshold around $750k-$1M.
+* **Buy-late or never** (seeds 12345, 31, 9999): reward ≈ 4.34, ruin
+  0.29%. Either purchase age ≥ 65 OR a liquid trigger so high
+  ($4.8-5.0M) that no path actually fires it. Identical rewards
+  across these three seeds confirm the "effectively never buy"
+  interpretation.
+
+**Gap between basins**: ~0.10 reward, **20× the per-seed MC noise
+floor (SE ≈ 0.005)**. This is genuine optimizer variance, not MC
+noise.
+
+**DE basin-hit rate**: 2 / 5 = 40% land in the better (buy-early)
+basin at our budget. The published v5 result (seed=12345) was
+unlucky — fell into the buy-late basin and reported it as the
+optimum.
+
+Inner-MC ranking inverts the truth: seed 12345's inner-MC obj
+of -4.440 looked best (highest worst-case reward across modes
+on 1000 inner paths), but on 30 fresh 4000-path MC seeds it ties
+the bottom of the rankings at 4.34. The optimizer's inner MC at
+1000 paths is too noisy to discriminate between basins reliably.
+
+### Q3 followup: BIPOP-CMA-ES
+
+Re-ran all four v5 configurations with BIPOP-CMA-ES (restart
+strategy, `--max-evals 3500-5000`) to see if a more sophisticated
+global optimizer escapes the buy-late attractor. Results:
+
+| Run | DE v5 reward | DE v5 buy decision | BIPOP v6 reward | BIPOP v6 buy decision |
+|---|---|---|---|---|
+| bm_gbm    | 4.517 | $556k TX age 40.9 (early) | 4.472 | $1.43M CA age **93.9** (never) |
+| bt_gbm    | 4.473 | $1.66M CA age 78.1 (late) | 4.487 | $1.92M OR age 81.8 (late) |
+| bm_robust | (in progress) | | (pending) | |
+| bt_robust | (pending) | | (pending) | |
+
+So far **BIPOP also falls into buy-late**, suggesting the buy-late
+basin is broad and easy for derivative-free global search to enter,
+while the buy-early basin is narrow and seed-specific. This makes
+the v5 published "buy late" result feel less like a search failure
+and more like a property of the joint search topography.
+
+For users, the practical takeaway: **don't trust a single optimizer
+run on this scenario**. Either:
+
+* run the optimizer at multiple seeds and take the best (4-8
+  restarts at our budget gives a 90%+ chance of hitting the
+  buy-early basin given a 40% per-seed rate);
+* warm-start one population member from the v4 buy-early optimum
+  to seed the better basin;
+* report the FRONTIER of (reward, ruin) pairs across all seeds
+  rather than a single point estimate.
 
 ## Implications
 
