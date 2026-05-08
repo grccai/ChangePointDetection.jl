@@ -118,64 +118,54 @@ def main():
         d_rn = rn_w - rn_n
         t_rw, p_rw = paired_t(d_rw)
         t_rn, p_rn = paired_t(d_rn)
-        rows.append((strat.label, strat.config,
-                      rw_w.mean(), rw_w.std(ddof=1)/np.sqrt(n_seeds),
-                      rw_n.mean(), rw_n.std(ddof=1)/np.sqrt(n_seeds),
-                      d_rw.mean(), d_rw.std(ddof=1)/np.sqrt(n_seeds),
-                      t_rw, p_rw,
-                      100*rn_w.mean(), 100*rn_w.std(ddof=1)/np.sqrt(n_seeds),
-                      100*rn_n.mean(), 100*rn_n.std(ddof=1)/np.sqrt(n_seeds),
-                      100*d_rn.mean(), 100*d_rn.std(ddof=1)/np.sqrt(n_seeds),
-                      t_rn, p_rn))
+        rows.append(dict(
+            label=strat.label, config=strat.config,
+            rw_with=float(rw_w.mean()), rw_with_se=float(rw_w.std(ddof=1)/np.sqrt(n_seeds)),
+            rw_never=float(rw_n.mean()), rw_never_se=float(rw_n.std(ddof=1)/np.sqrt(n_seeds)),
+            d_rw=float(d_rw.mean()), d_rw_se=float(d_rw.std(ddof=1)/np.sqrt(n_seeds)),
+            t_rw=float(t_rw), p_rw=float(p_rw),
+            ruin_with_pp=float(100*rn_w.mean()), ruin_with_pp_se=float(100*rn_w.std(ddof=1)/np.sqrt(n_seeds)),
+            ruin_never_pp=float(100*rn_n.mean()), ruin_never_pp_se=float(100*rn_n.std(ddof=1)/np.sqrt(n_seeds)),
+            d_ruin_pp=float(100*d_rn.mean()), d_ruin_pp_se=float(100*d_rn.std(ddof=1)/np.sqrt(n_seeds)),
+            t_ruin=float(t_rn), p_ruin=float(p_rn),
+        ))
 
-    # ---- Print summary ----
+    # Persist data FIRST so print/plot bugs don't cost another eval pass.
+    out_path = REPO / "figures" / "trial_rental_realistic_v8" / "ab_no_rental.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(rows, indent=2))
+    print(f"Wrote {out_path}\n")
+
+    # ---- Print summary tables ----
     print(f"{'strategy':<28}  {'reward (with)':>16}  {'reward (never)':>16}  "
           f"{'Δreward':>17}  {'paired t / p':>20}")
     print("-" * 110)
-    for r in sorted(rows, key=lambda v: -v[6]):  # sort by Δreward desc
-        label, _, rw_wm, rw_we, rw_nm, rw_ne, drw, drwe, trw, prw, *_ = r
-        print(f"{label:<28}  {rw_wm:.4f}±{rw_we:.4f}  "
-              f"{rw_nm:.4f}±{rw_ne:.4f}  "
-              f"{drw:+.4f}±{drwe:.4f}  "
-              f"t={trw:+5.1f}, p={prw:.4f}")
+    for r in sorted(rows, key=lambda v: -v["d_rw"]):
+        print(f"{r['label']:<28}  "
+              f"{r['rw_with']:.4f}±{r['rw_with_se']:.4f}  "
+              f"{r['rw_never']:.4f}±{r['rw_never_se']:.4f}  "
+              f"{r['d_rw']:+.4f}±{r['d_rw_se']:.4f}  "
+              f"t={r['t_rw']:+5.1f}, p={r['p_rw']:.4f}")
 
     print()
     print(f"{'strategy':<28}  {'ruin% (with)':>16}  {'ruin% (never)':>16}  "
           f"{'Δruin (pp)':>17}  {'paired t / p':>20}")
     print("-" * 110)
-    for r in sorted(rows, key=lambda v: v[16]):  # sort by Δruin asc
-        label, _, *rest = r
-        rn_wm, rn_we = rest[10], rest[11]
-        rn_nm, rn_ne = rest[12], rest[13]
-        drn, drne, trn, prn = rest[14], rest[15], rest[16], rest[17]
-        print(f"{label:<28}  {rn_wm:.3f}±{rn_we:.3f}pp   "
-              f"{rn_nm:.3f}±{rn_ne:.3f}pp   "
-              f"{drn:+.3f}±{drne:.3f}pp   "
-              f"t={trn:+5.1f}, p={prn:.4f}")
-
-    # ---- Persist ----
-    out_path = REPO / "figures" / "trial_rental_realistic_v8" / "ab_no_rental.json"
-    out = []
-    for r in rows:
-        out.append(dict(strategy=r[0], config=r[1],
-                         rw_with=r[2], rw_with_se=r[3],
-                         rw_never=r[4], rw_never_se=r[5],
-                         d_rw=r[6], d_rw_se=r[7], t_rw=r[8], p_rw=r[9],
-                         ruin_with_pp=r[10], ruin_with_pp_se=r[11],
-                         ruin_never_pp=r[12], ruin_never_pp_se=r[13],
-                         d_ruin_pp=r[14], d_ruin_pp_se=r[15],
-                         t_ruin=r[16], p_ruin=r[17]))
-    out_path.write_text(json.dumps(out, indent=2))
-    print(f"\nWrote {out_path}")
+    for r in sorted(rows, key=lambda v: v["d_ruin_pp"]):
+        print(f"{r['label']:<28}  "
+              f"{r['ruin_with_pp']:.3f}±{r['ruin_with_pp_se']:.3f}pp  "
+              f"{r['ruin_never_pp']:.3f}±{r['ruin_never_pp_se']:.3f}pp  "
+              f"{r['d_ruin_pp']:+.3f}±{r['d_ruin_pp_se']:.3f}pp  "
+              f"t={r['t_ruin']:+5.1f}, p={r['p_ruin']:.4f}")
 
     # ---- Plot Δreward and Δruin ----
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7))
-    rows_sorted = sorted(rows, key=lambda v: -v[6])
-    labels = [r[0] for r in rows_sorted]
-    drws = [r[6] for r in rows_sorted]
-    drwes = [r[7] for r in rows_sorted]
-    drns = [r[14] for r in rows_sorted]
-    drnes = [r[15] for r in rows_sorted]
+    rs = sorted(rows, key=lambda v: -v["d_rw"])
+    labels = [r["label"] for r in rs]
+    drws = [r["d_rw"] for r in rs]
+    drwes = [r["d_rw_se"] for r in rs]
+    drns = [r["d_ruin_pp"] for r in rs]
+    drnes = [r["d_ruin_pp_se"] for r in rs]
     y = np.arange(len(labels))[::-1]
 
     ax1.barh(y, drws, xerr=drwes, capsize=3,
@@ -204,7 +194,7 @@ def main():
     out_png = REPO / "figures" / "trial_rental_realistic_v8" / "ab_no_rental.png"
     fig.savefig(out_png, dpi=140, bbox_inches="tight")
     plt.close(fig)
-    print(f"Wrote {out_png}")
+    print(f"\nWrote {out_png}")
 
 
 if __name__ == "__main__":

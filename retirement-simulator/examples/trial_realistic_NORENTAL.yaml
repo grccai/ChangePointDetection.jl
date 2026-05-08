@@ -1,0 +1,133 @@
+# Auto-generated: trial_rental_realistic.yaml minus rental_property.
+# Used as the control for the rental-purchase A/B study.
+
+profile:
+  birthdate: 1989-05-05
+  start_date: 2026-05-05
+  retirement_date: 2044-05-05
+  end_of_plan_date: 2084-05-05
+  filing_status: single
+income:
+  sources:
+  - state: CA
+    start: 2026-05-05
+    end: 2026-08-20
+    gross_annual: 240000
+    growth_rate: 0.05
+  - state: OR
+    start: 2026-08-20
+    end: 2028-12-31
+    gross_annual: 146000
+    growth_rate: 0.05
+  - state: WA
+    start: 2026-08-20
+    end: 2028-12-31
+    gross_annual: 97400
+    growth_rate: 0.05
+  - state: CA
+    start: 2028-12-31
+    end: 2044-05-05
+    gross_annual: 273400
+    growth_rate: 0.05
+state_taxes:
+  residency:
+  - state: CA
+    start: 2026-05-05
+    end: 2026-08-20
+  - state: WA
+    start: 2026-08-20
+    end: 2028-12-31
+  - state: CA
+    start: 2028-12-31
+    end: 2084-05-05
+savings:
+  rate: 0.4
+  contributions:
+    trad_401k: max
+    roth_401k: 0
+    trad_ira: 0
+    roth_ira: 7000
+    mega_backdoor_roth: max
+    employer_match_rate: 0.03
+spending:
+  annual_real: 100000
+  smile: bengen
+  working_annual_real: 90000
+  flexible:
+    floor_real: 50000
+    floor_change_age: 70
+    floor_after_real: 80000
+    sensitivity: 1.0
+initial_portfolio:
+  taxable:
+    lots:
+    - asset: stock
+      market_value: 145800
+      cost_basis: 72900
+      age_years: 0.5
+    - asset: stock
+      market_value: 145800
+      cost_basis: 81000
+      age_years: 3.0
+    - asset: cash
+      market_value: 16200
+      cost_basis: 16200
+      age_years: 0.5
+    - asset: cash
+      market_value: 16200
+      cost_basis: 16200
+      age_years: 3.0
+  traditional:
+    stock: 136000
+    bond: 24000
+    cash: 0
+  roth:
+    stock: 136000
+    bond: 24000
+    cash: 0
+    basis: 80000
+target_allocations:
+  taxable:
+    stock: 0.9
+    bond: 0.0
+    cash: 0.1
+  traditional:
+    stock: 0.85
+    bond: 0.15
+    cash: 0.0
+  roth:
+    stock: 0.85
+    bond: 0.15
+    cash: 0.0
+market:
+  stocks:
+    real_return: 0.06
+    vol: 0.18
+  bonds:
+    real_return: 0.02
+    vol: 0.06
+  cash:
+    real_return: 0.005
+    vol: 0.01
+  inflation_mean: 0.025
+  inflation_vol: 0.0
+  correlation_stock_bond: 0.1
+  correlation_stock_cash: 0.0
+  correlation_bond_cash: 0.0
+social_security:
+  monthly_at_67: 4855
+  claim_age: 70
+withdrawal:
+  strategy: tax_aware
+  roth_conversion_target_bracket: 0.12
+  aca_magi_cap: 50000
+simulation:
+  n_paths: 5000
+  seed: 42
+  return_model: gbm
+inheritances:
+- amount_real: 1000000
+  account: taxable
+  hazard:
+    profile: healthy_65
+    current_age: 65
