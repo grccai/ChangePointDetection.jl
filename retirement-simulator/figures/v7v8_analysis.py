@@ -69,7 +69,9 @@ def _parse_v7_log(path: Path) -> Strategy | None:
 
     def _findf(pat, txt=txt, default=None):
         m = re.search(pat, txt)
-        return float(m.group(1)) if m else default
+        if not m:
+            return default
+        return float(m.group(1).replace(",", ""))
 
     def _finds(pat, txt=txt, default=None):
         m = re.search(pat, txt)
@@ -141,6 +143,15 @@ def _parse_v8_json(path: Path) -> Strategy | None:
         min_taxable=rp["min_taxable_real"],
     )
     pp = d.get("policy_params", {}) or {}
+    # Normalize key names so the rest of the pipeline doesn't care
+    # whether the source was a v7 .log (uses conv_fire / conv_ss) or a
+    # v8 .json (uses conv_during_fire_gap / conv_during_ss_window).
+    if "conv_during_fire_gap" in pp:
+        pp["conv_fire"] = pp.pop("conv_during_fire_gap")
+    if "conv_during_ss_window" in pp:
+        pp["conv_ss"] = pp.pop("conv_during_ss_window")
+    if "wealth_responsiveness" in pp:
+        pp["wealth_resp"] = pp.pop("wealth_responsiveness")
     if "stock_high" in pp:
         kind = "bond_tent"
     elif "target_total_stock_frac" in pp:
