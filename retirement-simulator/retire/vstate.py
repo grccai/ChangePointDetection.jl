@@ -115,6 +115,13 @@ class VState:
     magi_n_by_year: np.ndarray = field(      # (P, H + 1)
         default_factory=lambda: np.zeros((0, 0)))
 
+    # Tax-loss-harvesting credit carryforward (nominal $). Each year a
+    # fraction of taxable account value is realised as a harvestable
+    # loss and accumulated here; applied against the year's gains/ord
+    # before tax is computed.
+    tlh_credit_n: np.ndarray = field(        # (P,)
+        default_factory=lambda: np.zeros(0))
+
     # Rental property (optional). All paths share the same scalar config in
     # the Scenario; per-path arrays track owned-state + value + debt. When
     # no rental is configured these are zero-length placeholders.
@@ -171,6 +178,7 @@ class VState:
             deferred_st_gain_n=zeros1.copy(),
             deferred_ord_n=zeros1.copy(),
             magi_n_by_year=np.zeros((n_paths, horizon + 1)),
+            tlh_credit_n=zeros1.copy(),
             rental_owned=np.zeros(n_paths, dtype=bool),
             rental_value_real=np.zeros(n_paths),
             mortgage_balance_nominal=np.zeros(n_paths),

@@ -117,6 +117,48 @@ def _irmaa_vec(magi_two_yrs_ago: np.ndarray, age: float,
     return out
 
 
+def _apply_tlh_vec(s: VState, tlh, ord_income: np.ndarray,
+                    ltcg_income: np.ndarray, nii_extra: np.ndarray | None,
+                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Sample this year's harvestable loss from the taxable account and
+    apply (with any prior carryforward) against the year's gains/ord
+    income. In-place mutation of `s.tlh_credit_n`.
+
+    Returns (ord_income_adj, ltcg_income_adj, nii_extra_adj). Order of
+    application:
+      1) accumulate this year's new harvest into the credit balance
+      2) net credit against ltcg_income (cap-gains offset, dollar-for-dollar)
+      3) net any remaining credit against ord_income up to ord_offset_cap
+      4) carry the remainder forward in tlh_credit_n
+    nii_extra is reduced symmetrically so NIIT also benefits.
+    """
+    if tlh is None or tlh.annual_alpha_frac <= 0:
+        return ord_income, ltcg_income, nii_extra
+    P = s.n_paths
+    # 1) Sample this year's harvestable loss (nominal $).
+    new_loss = tlh.annual_alpha_frac * np.maximum(0.0, s.taxable_total())
+    s.tlh_credit_n = s.tlh_credit_n + new_loss
+
+    # 2) Apply against LTCG dollar-for-dollar.
+    cg_use = np.minimum(s.tlh_credit_n, np.maximum(0.0, ltcg_income))
+    ltcg_adj = ltcg_income - cg_use
+    s.tlh_credit_n = s.tlh_credit_n - cg_use
+    # Reduce nii_extra by the LTCG-portion offset (NIIT shrinks too).
+    if nii_extra is not None:
+        nii_extra_adj = np.maximum(0.0, nii_extra - cg_use)
+    else:
+        nii_extra_adj = nii_extra
+
+    # 3) Up to ord_offset_cap of remaining credit offsets ord income.
+    ord_use = np.minimum(s.tlh_credit_n,
+                          np.minimum(np.maximum(0.0, ord_income),
+                                       tlh.ord_offset_cap))
+    ord_adj = ord_income - ord_use
+    s.tlh_credit_n = s.tlh_credit_n - ord_use
+
+    return ord_adj, ltcg_adj, nii_extra_adj
+
+
 def _federal_tax_vec(ord_income: np.ndarray, ltcg_income: np.ndarray,
                      ss_benefit: np.ndarray, fs: FilingStatus,
                      ty: TaxYear = TAX_2024,
@@ -716,9 +758,14 @@ def _step_accumulation(s: VState, scn: Scenario, age: float, year_idx: int,
     wages_after_pretax = max(0.0, total_wages - pretax_trad)
     ord_income_fed = wages_after_pretax + ord_div
     ltcg_income = qual_div
+    nii_extra_fed = ord_div
+    # TLH credit: sample this year's harvestable loss from the taxable
+    # account, apply against LTCG -> NIIT base -> up to $3k of ord.
+    ord_income_fed, ltcg_income, nii_extra_fed = _apply_tlh_vec(
+        s, scn.tlh, ord_income_fed, ltcg_income, nii_extra_fed)
     fed_tax, _ = _federal_tax_vec(ord_income_fed, ltcg_income,
                                   np.zeros(P), fs,
-                                  nii_extra=ord_div)
+                                  nii_extra=nii_extra_fed)
     # State tax: wages by employment state (apportioning pretax_401k);
     # plus residency tax on dividends.
     state_wage_tax_scalar = state_wages_tax(
@@ -904,6 +951,10 @@ def _step_decumulation(s: VState, scn: Scenario, age: float, year_idx: int,
     # Trad withdrawals, conversions, and wages are NOT NII (excluded by
     # IRS).
     nii_extra = ord_div + st_g + deferred_st_n
+    # TLH credit: sample this year's harvestable loss + apply prior
+    # carryforward against ltcg -> NIIT base -> up to $3k ord.
+    ord_income, ltcg_income, nii_extra = _apply_tlh_vec(
+        s, scn.tlh, ord_income, ltcg_income, nii_extra)
     fed_tax, _ = _federal_tax_vec(ord_income, ltcg_income, ss_nominal, fs,
                                    nii_extra=nii_extra)
     # In retirement: any wages from active income sources still apply

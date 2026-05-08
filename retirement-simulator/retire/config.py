@@ -445,6 +445,36 @@ class RentalProperty:
 
 
 @dataclass
+class TaxLossHarvesting:
+    """Coarse tax-loss-harvesting credit model.
+
+    Each year a fraction of the taxable account's market value is
+    realised as a harvestable capital loss. The IRS treatment we model:
+
+    1. Net the year's harvestable loss against this year's LTCG (and ST
+       cap gains via ord_income realisations) dollar-for-dollar.
+    2. Up to `ord_offset_cap` (default $3,000/yr per IRS Schedule D
+       line 21 single-filer limit) of remaining net loss can offset
+       ordinary income.
+    3. Any remainder accumulates as a `tlh_credit_n` carryforward and
+       is applied to future years until exhausted.
+
+    Wash-sale and per-lot specific-ID are NOT modelled — we assume the
+    user maintains target exposure via a substantially-different
+    replacement asset within the 30-day window.
+
+    `annual_alpha_frac` defaults to 0.0 (TLH disabled). A reasonable
+    opt-in value is 0.003 (~0.3% of taxable AUM/yr), conservative end of
+    Vanguard / Kitces estimates of "advisor alpha" from TLH at 35% margin.
+    Higher-vol portfolios can plausibly support 0.005-0.010.
+    """
+    annual_alpha_frac: float = 0.0       # disabled by default; opt-in
+    ord_offset_cap: float = 3000.0        # $3k/yr nominal IRS limit
+    # ord_offset_cap is in 2024 nominal $; we don't index it because the
+    # IRS hasn't either since 1978. Real value erodes ~2.5%/yr.
+
+
+@dataclass
 class Scenario:
     profile: Profile
     state_taxes: StateTimeline
@@ -458,6 +488,7 @@ class Scenario:
     simulation: SimulationParams = field(default_factory=SimulationParams)
     inheritances: list[Inheritance] = field(default_factory=list)
     rental_property: RentalProperty | None = None
+    tlh: TaxLossHarvesting = field(default_factory=TaxLossHarvesting)
 
 
 # ---------- YAML helpers ----------
@@ -699,6 +730,12 @@ def load_scenario(path: str | Path) -> Scenario:
             ),
         )
 
+    tlh_raw = raw.get("tax_loss_harvesting", {}) or {}
+    tlh = TaxLossHarvesting(
+        annual_alpha_frac=float(tlh_raw.get("annual_alpha_frac", 0.0)),
+        ord_offset_cap=float(tlh_raw.get("ord_offset_cap", 3000.0)),
+    )
+
     return Scenario(
         profile=profile, state_taxes=timeline,
         savings=savings, spending=spending,
@@ -707,4 +744,5 @@ def load_scenario(path: str | Path) -> Scenario:
         social_security=ss, withdrawal=wd, simulation=sim,
         inheritances=inheritances,
         rental_property=rental,
+        tlh=tlh,
     )

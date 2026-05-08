@@ -130,54 +130,50 @@ def _snap_conversion(raw: float) -> float | None:
 
 # ---------- Rental decision variables ----------
 # When OptimizerConfig.optimize_rental is True and the scenario has a
-# rental_property, the search vector is extended by 5 floats appended after
-# the policy-specific params:
+# rental_property, the search vector is extended by 3 floats appended
+# after the policy-specific params:
 #
-#   r0  min_age              [40, 100]   purchase trigger age threshold;
-#                                         choosing >= horizon end-of-plan age
-#                                         effectively means "never buy".
-#   r1  min_liquid_real_M    [0.5, 5.0]  in $M; trigger liquid-wealth gate
-#   r2  min_taxable_real_M   [0.1, 2.0]  in $M; trigger taxable-wealth gate
-#   r3  price_real_M         [0.4, 2.0]  in $M; purchase price
-#   r4  state_idx            [0, 2.99]   snaps to {TX, OR, CA}, the
-#                                         no-tax / mid-tax / high-tax tiers
-#                                         relevant to rental income sourcing.
+#   r0  min_liquid_real_M    [0.5, 5.0]  in $M; liquid-wealth purchase gate
+#   r1  min_taxable_real_M   [0.1, 2.0]  in $M; taxable-wealth purchase gate
+#                                         (the simulator floors this at the
+#                                         actual downpayment amount, so a
+#                                         too-low value is silently raised)
+#   r2  price_real_M         [0.4, 2.0]  in $M; purchase price
 #
-# Snap rules: r4 floor()s to int and indexes _RENTAL_STATES.
+# Removed in this iteration:
+#   * `state_idx` — `location_state` is now a YAML-only parameter on
+#     `rental_property.location_state`; the optimizer no longer searches
+#     over it. Rationale: state choice is mostly an artefact of practical
+#     constraints (where you live, can manage a property, want to invest)
+#     not an optimization variable.
+#   * `min_age` — also a YAML-only parameter on `rental_property.trigger.
+#     min_age`. Rationale: the wealth gates (min_liquid + min_taxable)
+#     are usually the binding constraints; min_age was redundant once
+#     wealth thresholds were realistic.
 RENTAL_PARAM_BOUNDS: list[tuple[float, float]] = [
-    (40.0, 100.0),    # min_age
     (0.5, 5.0),       # min_liquid ($M)
     (0.1, 2.0),       # min_taxable ($M)
     (0.4, 2.0),       # price ($M)
-    (0.0, 2.999),     # state_idx -> {TX, OR, CA}
 ]
-_RENTAL_STATES = ("TX", "OR", "CA")
 RENTAL_NPARAMS = len(RENTAL_PARAM_BOUNDS)
-
-
-def _snap_rental_state(idx_raw: float) -> str:
-    idx = int(np.floor(max(0.0, min(len(_RENTAL_STATES) - 1e-9, idx_raw))))
-    return _RENTAL_STATES[idx]
 
 
 def decode_rental(x_tail: np.ndarray | list[float],
                   rp_base: RentalProperty) -> RentalProperty:
-    """Build a RentalProperty by overriding `rp_base` with the 5 trailing
-    decision vars."""
+    """Build a RentalProperty by overriding `rp_base` with the 3 trailing
+    decision vars. `location_state` and `trigger.min_age` are preserved
+    from `rp_base` (i.e., they come from the YAML, not the optimizer)."""
     if len(x_tail) != RENTAL_NPARAMS:
         raise ValueError(
             f"expected {RENTAL_NPARAMS} rental params, got {len(x_tail)}")
-    min_age = float(np.clip(x_tail[0], 40.0, 100.0))
-    min_liquid = float(np.clip(x_tail[1], 0.5, 5.0)) * 1_000_000
-    min_taxable = float(np.clip(x_tail[2], 0.1, 2.0)) * 1_000_000
-    price = float(np.clip(x_tail[3], 0.4, 2.0)) * 1_000_000
-    state = _snap_rental_state(x_tail[4])
+    min_liquid = float(np.clip(x_tail[0], 0.5, 5.0)) * 1_000_000
+    min_taxable = float(np.clip(x_tail[1], 0.1, 2.0)) * 1_000_000
+    price = float(np.clip(x_tail[2], 0.4, 2.0)) * 1_000_000
     return replace(
         rp_base,
         price_real=price,
-        location_state=state,
         trigger=RentalPurchaseTrigger(
-            min_age=min_age,
+            min_age=rp_base.trigger.min_age,
             min_liquid_real_wealth=min_liquid,
             min_taxable_real_wealth=min_taxable,
         ),
