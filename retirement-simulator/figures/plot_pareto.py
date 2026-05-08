@@ -61,6 +61,23 @@ def _bm_v6_gbm(scn):
     return build_bodie_merton_policy(x, scn, retirement_age=retirement_age)
 
 
+def _bm_v6_robust(scn):
+    """BIPOP bm_robust: Merton 51.74%, 24.19% cash, gamma ≈ 3.28."""
+    retirement_age = scn.profile.retirement_age
+    mu, rf, sigma = 0.06, 0.005, 0.18
+    gamma = (mu - rf) / (0.5174 * sigma**2)
+    x = [gamma, 0.03, 0.2419, 3.0, 0.0, 1.0]
+    return build_bodie_merton_policy(x, scn, retirement_age=retirement_age)
+
+
+def _bt_v6_robust(scn):
+    """BIPOP bt_robust: stock 99.94/63.14 V at 60, span 17, 34% cash."""
+    retirement_age = scn.profile.retirement_age
+    tent_offset = 59.6 - retirement_age
+    x = [0.9994, 0.6314, tent_offset, 16.9, 0.3416, 2.0, 5.0, 0.9998, 0.206]
+    return build_bond_tent_policy(x, retirement_age=retirement_age)
+
+
 def _bm_seed7(scn):
     """seed=7 bm_robust DE optimum. Use v5 bm_robust allocation; only the
     rental override changes across seeds."""
@@ -107,12 +124,18 @@ STRATEGIES = {
     "seed=9999 bm rob":  (_bm_seed7, dict(price_real=1_083_606, location_state="CA",
                           min_age=65.2, min_liquid=4_987_347, min_taxable=1_314_403),
                           "v5_seed", "late"),
-    # BIPOP-CMA-ES (so far: bm_gbm, bt_gbm)
+    # BIPOP-CMA-ES (all 4 done)
     "v6 bm gbm BIPOP":   (_bm_v6_gbm, dict(price_real=1_434_566, location_state="CA",
                           min_age=93.9, min_liquid=2_005_048, min_taxable=671_295),
                           "v6_bipop", "late"),
     "v6 bt gbm BIPOP":   (_bt_v6_gbm, dict(price_real=1_923_378, location_state="OR",
                           min_age=81.8, min_liquid=3_107_121, min_taxable=1_771_284),
+                          "v6_bipop", "late"),
+    "v6 bm robust BIPOP": (_bm_v6_robust, dict(price_real=1_831_802, location_state="OR",
+                          min_age=92.6, min_liquid=4_520_253, min_taxable=651_834),
+                          "v6_bipop", "late"),
+    "v6 bt robust BIPOP": (_bt_v6_robust, dict(price_real=619_581, location_state="TX",
+                          min_age=83.8, min_liquid=2_578_299, min_taxable=1_757_844),
                           "v6_bipop", "late"),
 }
 
@@ -181,6 +204,8 @@ def main():
         "seed=101 bm rob":(8, 7),
         "v6 bm gbm BIPOP": (10, 4),
         "v6 bt gbm BIPOP": (10, 4),
+        "v6 bm robust BIPOP": (10, -10),
+        "v6 bt robust BIPOP": (10, 4),
     }
 
     fig, ax = plt.subplots(figsize=(11, 7.5))

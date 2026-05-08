@@ -147,32 +147,73 @@ the bottom of the rankings at 4.34. The optimizer's inner MC at
 ### Q3 followup: BIPOP-CMA-ES
 
 Re-ran all four v5 configurations with BIPOP-CMA-ES (restart
-strategy, `--max-evals 3500-5000`) to see if a more sophisticated
-global optimizer escapes the buy-late attractor. Results:
+strategy, `restarts=9`, `incpopsize=2.0`, `--max-evals 3500-5000`)
+to see if a more sophisticated global optimizer escapes the
+buy-late attractor. Results:
 
-| Run | DE v5 reward | DE v5 buy decision | BIPOP v6 reward | BIPOP v6 buy decision |
+| Run | DE v5 inner-MC | DE v5 buy | BIPOP v6 inner-MC | BIPOP v6 buy |
 |---|---|---|---|---|
-| bm_gbm    | 4.517 | $556k TX age 40.9 (early) | 4.472 | $1.43M CA age **93.9** (never) |
+| bm_gbm    | 4.517 | $556k TX age 40.9 (**early**) | 4.472 | $1.43M CA age 93.9 (never) |
 | bt_gbm    | 4.473 | $1.66M CA age 78.1 (late) | 4.487 | $1.92M OR age 81.8 (late) |
-| bm_robust | (in progress) | | (pending) | |
-| bt_robust | (pending) | | (pending) | |
+| bm_robust | 4.521 worst | $636k OR age 78.6 (late) | 4.444 worst | $1.83M OR age 92.6 (never) |
+| bt_robust | 4.440 worst | $850k TX age 44.9 (early-ish) | 4.453 worst | $620k TX age 83.8 (late) |
 
-So far **BIPOP also falls into buy-late**, suggesting the buy-late
-basin is broad and easy for derivative-free global search to enter,
-while the buy-early basin is narrow and seed-specific. This makes
-the v5 published "buy late" result feel less like a search failure
-and more like a property of the joint search topography.
+**4 of 4 BIPOP runs landed in buy-late / never basins.** None found
+the early-buy basin that DE seeds 7 and 101 successfully reached.
+30-seed paired evaluation against the realistic scenario (final-eval
+reward, `figures/trial_rental_realistic_v5/pareto.png`):
+
+| Run | 30-seed reward | 30-seed ruin |
+|---|---|---|
+| v6 bm gbm BIPOP    | 4.3932 ± 0.005 | 0.13% ± 0.01pp |
+| v6 bt gbm BIPOP    | 4.3890 ± 0.005 | 0.52% ± 0.02pp |
+| v6 bm robust BIPOP | 4.3429 ± 0.006 | 0.29% ± 0.02pp |
+| v6 bt robust BIPOP | 4.3455 ± 0.006 | 0.40% ± 0.02pp |
+
+For comparison, the actual best policy (v5 bm gbm, single DE seed
+that happened to fall into the early basin) scores **4.4712 ±
+0.005** at 0.27% ruin — which Pareto-dominates every BIPOP run by
+a margin of 0.08-0.13 reward.
+
+**The diagnosis is clearer with full BIPOP data**: the buy-late
+basin is genuinely large in the joint (allocation, rental) decision
+space — it captures any policy that pushes `min_age` past the
+plan's effective horizon or `min_liquid` above attainable wealth.
+The buy-early basin is narrow: it requires a specific combination
+of moderate Merton constant + small rental + early trigger. CMA-ES
+restart strategies don't help when the bias of the search dynamics
+(e.g., default Sobol init in DE, default N(0,1) init in CMA) puts
+most starts inside the broad late basin.
 
 For users, the practical takeaway: **don't trust a single optimizer
-run on this scenario**. Either:
+run on this scenario** — including BIPOP-CMA-ES. Either:
 
-* run the optimizer at multiple seeds and take the best (4-8
-  restarts at our budget gives a 90%+ chance of hitting the
-  buy-early basin given a 40% per-seed rate);
-* warm-start one population member from the v4 buy-early optimum
-  to seed the better basin;
+* run DE at multiple seeds and take the best (4-8 seeds at our
+  budget gives ~90% chance of at least one hit on the buy-early
+  basin given the empirical 40% per-seed rate);
+* warm-start one population member from the v4 buy-early optimum;
 * report the FRONTIER of (reward, ruin) pairs across all seeds
-  rather than a single point estimate.
+  rather than a single point estimate; this is what
+  `figures/trial_rental_realistic_v5/pareto.png` shows for the
+  16 strategies we have so far.
+
+### The actual winner
+
+After all this work, the single Pareto-dominant strategy is **v5
+bodie_merton + early-rental GBM** (the one DE seed of v5 that
+happened to land in the early basin):
+
+* **Allocation**: Bodie-Merton with γ ≈ 5.7, Merton stock target
+  29.78%, taxable cash 8.3%, no FIRE-gap conversions, 22%
+  SS-window conversions, 96% trad split.
+* **Rental**: $556k TX, trigger at age 40.9 with $775k liquid
+  + $215k taxable.
+* **30-seed reward**: 4.4712 ± 0.005 (best in the 16-strategy set)
+* **30-seed ruin**: 0.27% (2nd lowest of the 16)
+
+This is the closest the v5 sweep got to the buy-early basin and it
+beats every v4 policy too — they all sit at higher ruin (0.7-1.8%)
+for slightly lower reward.
 
 ## Implications
 
