@@ -280,9 +280,109 @@ The bm_v4_robust optimum:
 * near-tied terminal wealth ($4.45M);
 * mode-balanced (gbm-reward 4.522 ≈ hist-reward 4.521).
 
-Single recommended baseline: **bodie_merton v4 robust + early CA
-rental**. For users who want to optimize purely for a smooth-tail
-GBM world (and don't care about historical regime risk),
-**bond_tent v4 GBM** has slightly higher GBM-mode reward but at
-2-3× higher historical-mode ruin.
+Single recommended baseline (under the v4 cost model): **bodie_merton
+v4 robust + early CA rental**. For users who want to optimize purely
+for a smooth-tail GBM world, **bond_tent v4 GBM** has slightly higher
+GBM-mode reward but 2-3× higher historical-mode ruin.
+
+## v5 (post realistic cost model)
+
+The v4 conclusions assumed a flat 2.5% lump operating cost on the
+rental property — no management fee, no tenant turnover, no big-ticket
+capex events, no legal/insurance, no refinance. Commit `aed92d1` added
+opt-in YAML fields for all of these, and `examples/trial_rental_
+realistic.yaml` calibrates them to defensible CA single-family-rental
+defaults:
+
+* property tax 1.1% / insurance 0.5% / maintenance 0.8% (legacy lump
+  zeroed; sum is similar but split out so QBI / refi can interact);
+* 8% management fee on gross rent;
+* $1500/yr real legal + umbrella;
+* 25%/yr tenant turnover with 2 months vacant + 5%-of-rent costs;
+* 10%/yr capex shocks lognormal (mean 2% of value, σ=0.6);
+* refinance enabled (long-run market rate 6% nominal, 1.5pp drop
+  threshold, 2.5% closing costs, 5y cooldown).
+
+In aggregate this strips ~$10-15k/yr real off the rental's NOI and
+adds left-tail variance. The optimizer's verdict on rental purchase
+**flips for 3 of 4 runs**:
+
+### v4 → v5 results
+
+| Run | v4 reward | v5 reward | v4 buy | v5 buy |
+|---|---|---|---|---|
+| bond_tent + rental, GBM | 4.563 | 4.473 | $1.28M TX, age 40.2 | **$1.66M CA, age 78.1** |
+| bodie_merton + rental, GBM | 4.555 | **4.517** | $1.48M CA, age 40.8 | $556k TX, age 40.9 |
+| bond_tent + rental, robust | 4.440 worst | 4.340 worst | $850k TX, age 44.9 | **$1.78M TX, age 58.1** |
+| bodie_merton + rental, robust | 4.521 worst | 4.362 worst | $858k CA, age 40.7 | **$636k OR, age 78.6** |
+
+* **3 of 4 v5 runs revert to "buy late or never"** — purchase ages
+  jump from 40-45 in v4 to 58-79 in v5, and the liquid-wealth gates
+  jump from $560k-$810k to $1.9M-$4.7M.
+* **Only `bodie_merton GBM`** still buys early — and at a much smaller
+  scale ($556k vs v4's $1.48M).
+* Rewards drop 0.10-0.15 across the board; ruin rates are similar.
+* The v4 "buy early, leverage your way into FIRE" recommendation is
+  **NOT robust to realistic operating costs**.
+
+### v5 rental decisions
+
+| Parameter | bt GBM | bm GBM | bt robust | bm robust |
+|---|---|---|---|---|
+| price_real | $1.66M | **$0.56M** | $1.78M | $0.64M |
+| location_state | CA | TX | TX | OR |
+| trigger.min_age | **78.1** | 40.9 | 58.1 | **78.6** |
+| trigger.min_liquid | $2.20M | $775k | $4.67M | $1.88M |
+| trigger.min_taxable | $1.17M | $215k | $1.67M | $732k |
+
+### v5 allocation shapes
+
+* **bond_tent v5 GBM**: stock 99% → 48% V at retirement, span 19y,
+  **0% taxable cash** (no need; rental purchase is 23 years away),
+  no FIRE-gap conv, 22% SS-window. The rental is a late-life
+  diversification play; allocation is conventional bond-tent.
+* **bodie_merton v5 GBM**: Merton **30%** (γ ≈ 5.7 — much more
+  risk-averse than v4's 4.3), 8% taxable cash. Modest cash buffer,
+  early small rental, no FIRE-gap conversions.
+* **bond_tent v5 robust**: stock 90% → 27% V at age 62, span 9y,
+  **33% taxable cash** (large buffer to ride out historical-mode
+  tails until the late rental purchase), 24% FIRE-gap + 22% SS-window
+  conversions.
+* **bodie_merton v5 robust**: Merton **52%** (γ ≈ 3.27, similar to
+  v4), **32% taxable cash** (big jump from v4's 13% — the optimizer
+  needs liquidity since the rental backstop only kicks in at age 79),
+  22% FIRE-gap + 12% SS-window conversions.
+
+### What changed
+
+The realistic cost model knocks roughly $10-15k/yr off real rental NOI
+and introduces left-tail capex risk. The leverage premium that drove
+v4's "buy at 41" optimum survives only in the GBM-mode bodie_merton run
+(where the historical tail isn't penalising the path), and even there
+at much-reduced scale. Under historical-mode tail risk (the robust
+runs) the rental purchase is pushed past retirement — bm_robust to
+age 79, bt_robust to age 58. In effect the optimizer recovers v1's
+"buy late or never" verdict — that earlier diagnosis was wrong because
+the simulator was missing tax fixes (commits b694910 / f81583a /
+5e623d0), but it was *right* about real estate not being a great
+leverage play once realistic costs are folded in.
+
+### Recommendation (v5)
+
+Use **bodie_merton v5 GBM** (reward 4.517, ruin 0.20%, buy a small
+$556k TX rental at age 41) if the user is comfortable with a
+pure-GBM modelling assumption, OR **bond_tent v5 robust** (worst-case
+reward 4.340, ruin 0.42%/1.60%, buy a $1.78M TX rental at retirement
+age 58) if they want the historical-tail hedge.
+
+The bigger lesson: **the rental decision is much more sensitive to
+operating-cost assumptions than to allocation policy**. The v4
+optimum was an artefact of the simulator under-counting rental
+operating costs. The "early-leverage" play is best confined to:
+* low-management-fee situations (self-management or very inexpensive
+  property managers, < 4% of gross rent);
+* scenarios where the user's profile sharply rewards near-term FIRE
+  hits (steep weight decay, BaristaFIRE floor, etc.);
+* property markets with significantly higher cap rates than the trial
+  scenario's 6%.
 

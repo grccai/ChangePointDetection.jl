@@ -157,6 +157,71 @@ def _bm_v4_robust(scn):
     return build_bodie_merton_policy(x, scn, retirement_age=retirement_age)
 
 
+# --- v5 (post realistic-cost-model) policies on trial_rental_realistic ---
+def _bt_v5_gbm(scn):
+    """v5 bond_tent on trial_rental_realistic, GBM, fire_prob_weighted.
+    Realistic costs flipped this run to 'buy late' — the rental block
+    was made unattractive enough by mgmt fees + capex shocks + turnover
+    that the optimizer pushed purchase to age 78 with $2.2M liquid gate."""
+    retirement_age = scn.profile.retirement_age
+    tent_offset = 54.6 - retirement_age
+    x = [0.9884, 0.4848, tent_offset, 19.1, 0.0031, 0.0, 3.0, 0.9946, 0.052]
+    return build_bond_tent_policy(x, retirement_age=retirement_age)
+
+
+def _bt_v5_robust(scn):
+    """v5 bond_tent robust on trial_rental_realistic. Tent at age 62,
+    deep V to 27%, 33% taxable cash. Late-life rental purchase."""
+    retirement_age = scn.profile.retirement_age
+    tent_offset = 62.1 - retirement_age
+    x = [0.9006, 0.2698, tent_offset, 8.9, 0.3303, 4.0, 3.0, 0.929, 0.209]
+    return build_bond_tent_policy(x, retirement_age=retirement_age)
+
+
+def _bm_v5_gbm(scn):
+    """v5 bodie_merton on trial_rental_realistic. Merton 29.78% target
+    -> gamma = 5.70 at trial market. The only v5 run that still buys
+    early — but at much smaller scale ($556k TX vs v4's $1.48M)."""
+    retirement_age = scn.profile.retirement_age
+    x = [5.70, 0.03, 0.0829, 0.0, 3.0, 0.9601]
+    return build_bodie_merton_policy(x, scn, retirement_age=retirement_age)
+
+
+def _bm_v5_robust(scn):
+    """v5 bodie_merton robust on trial_rental_realistic. Merton 51.91%
+    -> gamma = 3.27. Big 32% taxable cash sleeve. Buys ONLY in late
+    life (age 79) above $1.88M liquid — the realistic costs strip the
+    leverage premium entirely under historical-mode tail risk."""
+    retirement_age = scn.profile.retirement_age
+    x = [3.27, 0.03, 0.3204, 3.0, 2.0, 0.988]
+    return build_bodie_merton_policy(x, scn, retirement_age=retirement_age)
+
+
+STRATEGIES_V5_REALISTIC = {
+    "static_baseline": (static_policy_from_yaml, None),
+    "bond_tent_v5_gbm": (
+        _bt_v5_gbm,
+        dict(price_real=1_661_830, location_state="CA",
+             min_age=78.1, min_liquid=2_198_419, min_taxable=1_168_111),
+    ),
+    "bodie_merton_v5_gbm": (
+        _bm_v5_gbm,
+        dict(price_real=556_298, location_state="TX",
+             min_age=40.9, min_liquid=775_369, min_taxable=215_241),
+    ),
+    "bond_tent_v5_robust": (
+        _bt_v5_robust,
+        dict(price_real=1_781_768, location_state="TX",
+             min_age=58.1, min_liquid=4_666_373, min_taxable=1_671_295),
+    ),
+    "bodie_merton_v5_robust": (
+        _bm_v5_robust,
+        dict(price_real=636_309, location_state="OR",
+             min_age=78.6, min_liquid=1_880_187, min_taxable=731_982),
+    ),
+}
+
+
 STRATEGIES_V4_RENTAL = {
     "static_baseline": (static_policy_from_yaml, None),
     "bond_tent_v4_gbm": (
@@ -234,9 +299,14 @@ def main():
     os.makedirs(snap_dir, exist_ok=True)
     # SCENARIO_ID="trial_rental_v4" -> use the v4 rental-aware strategy set
     # (each strategy ships both a policy and a rental override dict).
-    use_v4 = scenario_id.endswith("_v4")
-    strategies = STRATEGIES_V4_RENTAL if use_v4 else \
-                  {k: (v, None) for k, v in STRATEGIES.items()}
+    use_v5 = scenario_id.endswith("_v5")
+    use_v4 = scenario_id.endswith("_v4") and not use_v5
+    if use_v5:
+        strategies = STRATEGIES_V5_REALISTIC
+    elif use_v4:
+        strategies = STRATEGIES_V4_RENTAL
+    else:
+        strategies = {k: (v, None) for k, v in STRATEGIES.items()}
     print(f"Running snapshots: {len(strategies)} strategies x "
           f"{len(RETURN_MODES)} return modes, n_paths={n_paths}")
     print(f"  scenario_id={scenario_id}  yaml={cfg_path}")

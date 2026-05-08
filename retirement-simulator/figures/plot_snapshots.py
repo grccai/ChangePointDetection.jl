@@ -27,11 +27,13 @@ FIG_SUBDIR = os.environ.get("FIG_SUBDIR", SCENARIO_ID)
 FIG_DIR = Path(__file__).resolve().parent / FIG_SUBDIR
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 
-if SCENARIO_ID.endswith("_v4"):
+if SCENARIO_ID.endswith("_v5"):
+    STRATEGIES = ["static_baseline", "bond_tent_v5_gbm",
+                  "bodie_merton_v5_gbm", "bond_tent_v5_robust",
+                  "bodie_merton_v5_robust"]
+elif SCENARIO_ID.endswith("_v4"):
     STRATEGIES = ["static_baseline", "bond_tent_v4_gbm",
                   "bodie_merton_v4_gbm", "bond_tent_v4_robust"]
-    # bodie_merton_v4_robust is appended at runtime once that optimizer
-    # run lands — see run_snapshots.py STRATEGIES_V4_RENTAL.
     if (SNAP_DIR / "bodie_merton_v4_robust__gbm.npz").exists():
         STRATEGIES.append("bodie_merton_v4_robust")
 else:
@@ -53,6 +55,10 @@ STRAT_LABELS = {
     "bond_tent_v4_robust": "BondTent v4 robust",
     "bodie_merton_v4_gbm": "Bodie-Merton v4 GBM",
     "bodie_merton_v4_robust": "Bodie-Merton v4 robust",
+    "bond_tent_v5_gbm": "BondTent v5 GBM",
+    "bond_tent_v5_robust": "BondTent v5 robust",
+    "bodie_merton_v5_gbm": "Bodie-Merton v5 GBM",
+    "bodie_merton_v5_robust": "Bodie-Merton v5 robust",
 }
 
 FIRE_TARGET = float(os.environ.get("FIRE_TARGET", "2500000"))
@@ -164,7 +170,11 @@ def fire_ruin_grid():
               "bond_tent_v4_gbm": "#1f77b4",
               "bond_tent_v4_robust": "#0d3d6e",
               "bodie_merton_v4_gbm": "#2ca02c",
-              "bodie_merton_v4_robust": "#155f1d"}
+              "bodie_merton_v4_robust": "#155f1d",
+              "bond_tent_v5_gbm": "#1f77b4",
+              "bond_tent_v5_robust": "#0d3d6e",
+              "bodie_merton_v5_gbm": "#2ca02c",
+              "bodie_merton_v5_robust": "#155f1d"}
     for c, mode in enumerate(RETURN_MODES):
         ax_fire = axes[0, c]
         ax_ruin = axes[1, c]
