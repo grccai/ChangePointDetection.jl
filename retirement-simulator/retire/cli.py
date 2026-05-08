@@ -123,10 +123,22 @@ def optimize_cmd(
     optimize_rental: bool = typer.Option(
         False,
         "--optimize-rental",
-        help="If the scenario has a rental_property block, also optimize the "
-             "rental decision: purchase trigger (min_age, min_liquid, "
-             "min_taxable), purchase price, and source state (snapped to "
-             "TX/OR/CA). Adds 5 dimensions to the search.",
+        help="If the scenario has a rental_property block, also optimize 3 "
+             "rental decision variables: liquid-wealth trigger, taxable-"
+             "wealth trigger, and purchase price. (location_state and "
+             "min_age are read from the YAML, not searched.)",
+    ),
+    fixed_trad_split: float = typer.Option(
+        1.0, "--fixed-trad-split",
+        help="Fraction of 401(k) pool to Traditional (rest to Roth 401k). "
+             "Used to be optimized; now plumbed in directly. Default 1.0 "
+             "matches the historical optimum. Vary for sensitivity tests.",
+    ),
+    fixed_r_hc: float = typer.Option(
+        0.03, "--fixed-r-hc",
+        help="Real discount rate for the Bodie-Merton human-capital "
+             "trajectory. Used to be optimized; now plumbed in directly. "
+             "Default 3% real. Range 0.0-0.08 typical; vary for sensitivity.",
     ),
 ) -> None:
     """Optimize allocation and contribution split for the scenario."""
@@ -143,7 +155,9 @@ def optimize_cmd(
                          ruin_max=ruin_max,
                          robust_return_modes=robust_mode_list,
                          algorithm=algorithm, max_evals=max_evals,
-                         optimize_rental=optimize_rental)
+                         optimize_rental=optimize_rental,
+                         fixed_trad_split=fixed_trad_split,
+                         fixed_r_hc=fixed_r_hc)
     print("Running differential evolution... (this can take a few minutes)")
     allocations, conv_bracket, trad_split, diag = optimize(scn, cfg)
     print(f"\n=== Optimal decisions (policy={diag['policy_class']}) ===")

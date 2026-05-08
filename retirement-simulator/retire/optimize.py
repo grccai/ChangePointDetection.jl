@@ -106,11 +106,30 @@ class OptimizerConfig:
     # evaluate worst-case across. Default = ['gbm', 'historical'] when
     # objective='fire_prob_robust'. Doubles per-eval MC cost.
     robust_return_modes: list[str] | None = None
-    # If True and the scenario has a rental_property, append 5 extra
+    # If True and the scenario has a rental_property, append 3 extra
     # decision variables to the search vector covering the rental's
-    # purchase trigger (min_age, min_liquid, min_taxable), purchase price,
-    # and source state. See RENTAL_PARAM_BOUNDS / decode_rental.
+    # liquid + taxable purchase gates and the property price. See
+    # RENTAL_PARAM_BOUNDS / decode_rental. (location_state and
+    # trigger.min_age come from the YAML.)
     optimize_rental: bool = False
+    # Fixed levers that USED to be optimization variables. They are
+    # plumbed into the policies directly rather than being searched. Set
+    # via CLI/programmatic config to run sensitivity sweeps without
+    # touching the YAML; the default values (1.0 / 0.03) match the
+    # historical optimizer-default behaviour.
+    #
+    # `fixed_trad_split` is the fraction of the 401(k) pool that goes
+    # to Traditional (rest to Roth 401(k)). YAML's
+    # `savings.contributions.trad_401k: max, roth_401k: 0` already
+    # implies 1.0; the optimizer's trad_split optima clustered tightly
+    # at 0.92–1.00 so the search dimension was wasted.
+    #
+    # `fixed_r_hc` is the real discount rate applied to future wages
+    # to derive the Bodie-Merton human-capital trajectory. Optima never
+    # printed it (jointly identifiable with γ); fixing at 3% real keeps
+    # γ alone as the risk-aversion lever.
+    fixed_trad_split: float = 1.0
+    fixed_r_hc: float = 0.03
 
 
 def _alloc(s: float, b: float) -> Allocation:
@@ -126,6 +145,60 @@ def _snap_conversion(raw: float) -> float | None:
     idx = int(round(raw))
     idx = max(0, min(len(candidates) - 1, idx))
     return candidates[idx]
+
+
+# ---------- Reduced parameter bounds (post r_hc / trad_split removal) ----
+#
+# Full bond_tent param vector is 9 elements (see policy.py). The reduced
+# vector drops index 7 (trad_contribution_split). Index 8 (wealth_resp)
+# stays — re-numbered to position 7 in the reduced vector.
+#
+# Full bodie_merton param vector is 6 elements. The reduced vector drops
+# index 1 (r_hc) and index 5 (trad_contribution_split). Indices 2-4 are
+# re-numbered to 1-3 in the reduced vector.
+BOND_TENT_REDUCED_PARAM_BOUNDS: list[tuple[float, float]] = [
+    (0.0, 1.0),     # 0  stock_high
+    (0.0, 1.0),     # 1  stock_low
+    (-15.0, 20.0),  # 2  tent_age_offset
+    (3.0, 30.0),    # 3  span
+    (0.0, 0.4),     # 4  taxable_cash
+    (0.0, 5.0),     # 5  conv FIRE-gap idx
+    (0.0, 5.0),     # 6  conv SS-window idx
+    (0.0, 2.0),     # 7  wealth_responsiveness   (was index 8)
+]
+
+BODIE_MERTON_REDUCED_PARAM_BOUNDS: list[tuple[float, float]] = [
+    (1.0, 10.0),    # 0  risk_aversion (γ)
+    (0.0, 0.4),     # 1  taxable_cash             (was index 2)
+    (0.0, 5.0),     # 2  conv FIRE-gap idx        (was index 3)
+    (0.0, 5.0),     # 3  conv SS-window idx       (was index 4)
+]
+
+
+def _expand_bond_tent_x(x_red, fixed_trad_split: float) -> list[float]:
+    """Expand the 8-element reduced bond_tent vector back into the
+    9-element form `build_bond_tent_policy` expects, slotting
+    `fixed_trad_split` into position 7."""
+    if len(x_red) != len(BOND_TENT_REDUCED_PARAM_BOUNDS):
+        raise ValueError(
+            f"expected {len(BOND_TENT_REDUCED_PARAM_BOUNDS)} reduced "
+            f"bond_tent params, got {len(x_red)}")
+    return [float(x_red[0]), float(x_red[1]), float(x_red[2]),
+            float(x_red[3]), float(x_red[4]), float(x_red[5]),
+            float(x_red[6]), fixed_trad_split, float(x_red[7])]
+
+
+def _expand_bodie_merton_x(x_red, fixed_r_hc: float,
+                            fixed_trad_split: float) -> list[float]:
+    """Expand the 4-element reduced bodie_merton vector back into the
+    6-element form `build_bodie_merton_policy` expects, slotting
+    `fixed_r_hc` into position 1 and `fixed_trad_split` into position 5."""
+    if len(x_red) != len(BODIE_MERTON_REDUCED_PARAM_BOUNDS):
+        raise ValueError(
+            f"expected {len(BODIE_MERTON_REDUCED_PARAM_BOUNDS)} reduced "
+            f"bodie_merton params, got {len(x_red)}")
+    return [float(x_red[0]), fixed_r_hc, float(x_red[1]),
+            float(x_red[2]), float(x_red[3]), fixed_trad_split]
 
 
 # ---------- Rental decision variables ----------
@@ -252,14 +325,17 @@ def _build_policy(x: np.ndarray, scn_base: Scenario,
             retirement_age=retirement_age,
             end_age=end_age, ss_age=ss_age)
     if cfg.policy_class == "bond_tent":
+        x_full = _expand_bond_tent_x(list(x), cfg.fixed_trad_split)
         return build_bond_tent_policy(
-            list(x), retirement_age=retirement_age, ss_age=ss_age)
+            x_full, retirement_age=retirement_age, ss_age=ss_age)
     if cfg.policy_class == "cppi":
         return build_cppi_policy(
             list(x), retirement_age=retirement_age, ss_age=ss_age)
     if cfg.policy_class == "bodie_merton":
+        x_full = _expand_bodie_merton_x(list(x), cfg.fixed_r_hc,
+                                          cfg.fixed_trad_split)
         return build_bodie_merton_policy(
-            list(x), scn=scn_base,
+            x_full, scn=scn_base,
             retirement_age=retirement_age, ss_age=ss_age)
     if cfg.policy_class == "multi_phase":
         return build_multi_phase_policy(
@@ -604,11 +680,11 @@ def optimize(scn: Scenario, cfg: OptimizerConfig | None = None
     elif cfg.policy_class == "three_knot_glide":
         bounds = list(THREE_KNOT_GLIDE_PARAM_BOUNDS)
     elif cfg.policy_class == "bond_tent":
-        bounds = list(BOND_TENT_PARAM_BOUNDS)
+        bounds = list(BOND_TENT_REDUCED_PARAM_BOUNDS)
     elif cfg.policy_class == "cppi":
         bounds = list(CPPI_PARAM_BOUNDS)
     elif cfg.policy_class == "bodie_merton":
-        bounds = list(BODIE_MERTON_PARAM_BOUNDS)
+        bounds = list(BODIE_MERTON_REDUCED_PARAM_BOUNDS)
     elif cfg.policy_class == "multi_phase":
         bounds = list(MULTI_PHASE_PARAM_BOUNDS)
     elif cfg.policy_class == "vol_targeting":
