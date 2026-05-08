@@ -108,10 +108,12 @@ def main():
     seeds = rng.integers(1, 1_000_000, size=n_seeds)
     print(f"Repeatability check: {n_seeds} seeds, n_paths=4000, "
           f"scenario={realistic}\n")
-    print(f"{'pair':<22}  {'reward_v4 (mean ± stderr)':<28}  "
-          f"{'reward_v5 (mean ± stderr)':<28}  "
-          f"{'Δ (v5 - v4)':<22}  {'paired t':<14}  {'Wilcoxon'}")
-    print("=" * 140)
+    print(f"{'pair':<22}  {'reward_v4 (mean ± SE)':<24}  "
+          f"{'reward_v5 (mean ± SE)':<24}  "
+          f"{'Δ reward':<22}  {'paired t / p':<20}  Wilcoxon")
+    print("=" * 145)
+    # Stash ruin arrays for the second-pass ruin paired test below
+    ruin_results = {}
     for name, (build4, rp4, build5, rp5) in PAIRS.items():
         rw4, rn4, tm4 = [], [], []
         rw5, rn5, tm5 = [], [], []
@@ -124,31 +126,44 @@ def main():
         delta = rw5 - rw4
         se4 = rw4.std(ddof=1) / np.sqrt(n_seeds)
         se5 = rw5.std(ddof=1) / np.sqrt(n_seeds)
-        # Paired t-test on the difference
         t_stat = delta.mean() / (delta.std(ddof=1) / np.sqrt(n_seeds))
         p_val = float(2 * (1 - stats.t.cdf(abs(t_stat), df=n_seeds - 1)))
-        # Wilcoxon signed-rank (non-parametric)
         try:
             w_stat, w_p = stats.wilcoxon(delta)
             w_str = f"p={w_p:.4f}"
         except ValueError:
             w_str = "n/a"
         print(f"{name:<22}  "
-              f"{rw4.mean():.4f} ± {se4:.4f}            "
-              f"{rw5.mean():.4f} ± {se5:.4f}            "
+              f"{rw4.mean():.4f} ± {se4:.4f}        "
+              f"{rw5.mean():.4f} ± {se5:.4f}        "
               f"{delta.mean():+.4f} (σ={delta.std(ddof=1):.4f})   "
               f"t={t_stat:+.2f}, p={p_val:.4f}  {w_str}")
+        ruin_results[name] = (np.array(rn4), np.array(rn5))
+
     print()
-    print(f"Median ruin v4 vs v5 (per pair):")
-    print(f"{'pair':<22}  {'ruin_v4 (median)':<22}  {'ruin_v5 (median)':<22}")
-    for name, (build4, rp4, build5, rp5) in PAIRS.items():
-        rn4, rn5 = [], []
-        for s in seeds:
-            _, ru4, _ = reward_and_ruin(realistic, build4, rp4, s)
-            _, ru5, _ = reward_and_ruin(realistic, build5, rp5, s)
-            rn4.append(ru4); rn5.append(ru5)
-        print(f"{name:<22}  {np.median(rn4)*100:>5.2f}%                 "
-              f"{np.median(rn5)*100:>5.2f}%")
+    print(f"{'pair':<22}  {'ruin_v4 (mean ± SE)':<24}  "
+          f"{'ruin_v5 (mean ± SE)':<24}  "
+          f"{'Δ ruin (pp)':<22}  {'paired t / p':<20}  Wilcoxon")
+    print("=" * 145)
+    for name, (rn4, rn5) in ruin_results.items():
+        delta_r = rn5 - rn4
+        se_r4 = rn4.std(ddof=1) / np.sqrt(n_seeds)
+        se_r5 = rn5.std(ddof=1) / np.sqrt(n_seeds)
+        if delta_r.std(ddof=1) > 0:
+            t_r = delta_r.mean() / (delta_r.std(ddof=1) / np.sqrt(n_seeds))
+            p_r = float(2 * (1 - stats.t.cdf(abs(t_r), df=n_seeds - 1)))
+            try:
+                _, w_pr = stats.wilcoxon(delta_r)
+                w_str_r = f"p={w_pr:.4f}"
+            except ValueError:
+                w_str_r = "n/a"
+        else:
+            t_r, p_r, w_str_r = float("nan"), float("nan"), "n/a"
+        print(f"{name:<22}  "
+              f"{100*rn4.mean():.3f}% ± {100*se_r4:.3f}pp        "
+              f"{100*rn5.mean():.3f}% ± {100*se_r5:.3f}pp        "
+              f"{100*delta_r.mean():+.3f}pp (σ={100*delta_r.std(ddof=1):.3f}pp) "
+              f"t={t_r:+.2f}, p={p_r:.4f}  {w_str_r}")
 
 
 if __name__ == "__main__":
